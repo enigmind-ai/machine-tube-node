@@ -56,7 +56,11 @@ fi
 cd "$INSTALL_DIR"
 
 echo "Installing npm dependencies"
-npm install
+if [ -f package-lock.json ]; then
+  npm ci --include=dev
+else
+  npm install --include=dev
+fi
 
 echo "Building mt-node"
 npm run build
@@ -79,3 +83,4 @@ Launcher: $WRAPPER_PATH
 Make sure $BIN_DIR is on PATH, then run:
   mt-node
 EOF
+
