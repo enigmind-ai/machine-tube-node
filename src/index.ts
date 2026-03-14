@@ -355,7 +355,23 @@ const server = http.createServer(async (req, res) => {
         paths,
         config,
         videoCount: videos.length,
+        publishedVideoCount: countPublishedMachineTubeVideos(),
         tunnel: tunnelManager.getSnapshot(),
+        heartbeat: buildHeartbeatPayload(req),
+      });
+    }
+
+    if (req.method === "GET" && url.pathname === "/heartbeat") {
+      return sendJson(res, 200, {
+        ok: true,
+        heartbeat: buildHeartbeatPayload(req),
+      });
+    }
+
+    if (req.method === "GET" && url.pathname === "/origin-health") {
+      return sendJson(res, 200, {
+        ok: true,
+        originHealth: buildOriginHealthPayload(req),
       });
     }
 
@@ -452,7 +468,7 @@ const server = http.createServer(async (req, res) => {
         title,
         description: typeof body.description === "string" ? body.description.trim() : "",
         tags: normalizeTags(body.tags),
-        sourceUrl: normalizeOptionalString(body.sourceUrl),
+        sourceUrl: normalizeOptionalString(body.sourceUrl) ?? `${tunnel.publicBaseUrl}/heartbeat`,
         transcript: normalizeOptionalString(body.transcript),
       });
 
@@ -779,6 +795,73 @@ function normalizeRegisteredVideo(value: unknown): RegisteredVideo | null {
       status: normalizeOptionalString(machineTube?.status),
       title: normalizeOptionalString(machineTube?.title),
     },
+  };
+}
+
+function countPublishedMachineTubeVideos(): number {
+  return videos.filter((video) => Boolean(video.machineTube.videoId)).length;
+}
+
+function buildHeartbeatPayload(req: IncomingMessage): JsonRecord {
+  const tunnel = tunnelManager.getSnapshot();
+  const heartbeatUrl = tunnel.publicBaseUrl ? `${tunnel.publicBaseUrl}/heartbeat` : buildLocalUrl(req, "/heartbeat");
+  const originHealthUrl = tunnel.publicBaseUrl ? `${tunnel.publicBaseUrl}/origin-health` : buildLocalUrl(req, "/origin-health");
+
+  return {
+    nodeId: config.nodeId,
+    status: "live",
+    version: "0.1.0",
+    startedAt: startedAt.toISOString(),
+    uptimeSeconds: Math.floor((Date.now() - startedAt.getTime()) / 1000),
+    heartbeatUrl,
+    originHealthUrl,
+    publicBaseUrl: tunnel.publicBaseUrl,
+    tunnel,
+    machineTube: {
+      configured: hasCompleteMachineTubeCredentials(config.machineTube),
+      baseUrl: config.machineTube.baseUrl || null,
+      agentId: config.machineTube.agentId || null,
+    },
+    publishedVideos: videos
+      .filter((video) => Boolean(video.machineTube.videoId))
+      .map((video) => {
+        const response = toVideoResponse(video, req);
+        return {
+          localVideoId: video.id,
+          machineTubeVideoId: video.machineTube.videoId,
+          machineTubeWatchUrl: video.machineTube.watchUrl,
+          playbackUrl: response.playbackUrl,
+          title: video.machineTube.title ?? video.fileName,
+          lastPublishedAt: video.machineTube.lastPublishedAt,
+          machineTubeStatus: video.machineTube.status,
+        };
+      }),
+  };
+}
+
+function buildOriginHealthPayload(req: IncomingMessage): JsonRecord {
+  const tunnel = tunnelManager.getSnapshot();
+  const checkedAt = new Date().toISOString();
+
+  return {
+    nodeId: config.nodeId,
+    checkedAt,
+    tunnelStatus: tunnel.status,
+    publicBaseUrl: tunnel.publicBaseUrl,
+    videos: videos.map((video) => {
+      const response = toVideoResponse(video, req);
+      const filePresent = existsSync(video.filePath);
+      const reachable = filePresent && Boolean(tunnel.publicBaseUrl);
+
+      return {
+        localVideoId: video.id,
+        machineTubeVideoId: video.machineTube.videoId,
+        playbackUrl: response.playbackUrl,
+        filePresent,
+        originStatus: reachable ? "reachable" : "degraded",
+        lastPublishedAt: video.machineTube.lastPublishedAt,
+      };
+    }),
   };
 }
 
