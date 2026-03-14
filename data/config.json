@@ -1,0 +1,12 @@
+{
+  "nodeId": "mtn_gekfgnor6k",
+  "api": {
+    "host": "0.0.0.0",
+    "port": 43111
+  },
+  "machineTube": {
+    "baseUrl": "",
+    "agentId": ""
+  },
+  "createdAt": "2026-03-14T17:33:23.122Z"
+}
