@@ -5,6 +5,7 @@ REPO_URL="https://github.com/enigmind-ai/machine-tube-node.git"
 INSTALL_DIR="${MT_NODE_INSTALL_DIR:-$HOME/.machine-tube/mt-node}"
 BRANCH="${MT_NODE_BRANCH:-main}"
 BIN_DIR="${MT_NODE_BIN_DIR:-$HOME/.local/bin}"
+INBOX_DIR="${MT_NODE_INBOX_DIR:-$HOME/MachineTube/videos}"
 WRAPPER_PATH="$BIN_DIR/mt-node"
 TMP_DIR=""
 
@@ -27,6 +28,7 @@ need_cmd node
 need_cmd npm
 
 mkdir -p "$BIN_DIR"
+mkdir -p "$INBOX_DIR"
 mkdir -p "$(dirname "$INSTALL_DIR")"
 
 if command -v git >/dev/null 2>&1; then
@@ -79,6 +81,9 @@ mt-node installed successfully.
 
 Install directory: $INSTALL_DIR
 Launcher: $WRAPPER_PATH
+MachineTube inbox: $INBOX_DIR
+
+Drop videos into the inbox folder, then start mt-node and publish the latest or a named inbox file.
 
 Make sure $BIN_DIR is on PATH, then run:
   mt-node

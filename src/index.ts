@@ -6,6 +6,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
   statSync,
   writeFileSync,
 } from "node:fs";
@@ -56,6 +57,7 @@ type RuntimePaths = {
   configPath: string;
   videosPath: string;
   binDir: string;
+  inboxDir: string;
   managedCloudflaredPath: string;
 };
 
@@ -82,6 +84,8 @@ type CloudflaredBootstrapResult = {
 
 type PublishRequestBody = {
   filePath?: unknown;
+  inboxFileName?: unknown;
+  useLatestInboxVideo?: unknown;
   title?: unknown;
   description?: unknown;
   tags?: unknown;
@@ -315,6 +319,7 @@ const paths: RuntimePaths = {
   configPath: resolve(process.env.MT_NODE_CONFIG_PATH ?? resolve(resolvedDataDir, "config.json")),
   videosPath: resolve(process.env.MT_NODE_VIDEOS_PATH ?? resolve(resolvedDataDir, "videos.json")),
   binDir: resolve(process.env.MT_NODE_BIN_DIR ?? resolve(resolvedDataDir, "bin")),
+  inboxDir: resolve(process.env.MT_NODE_INBOX_DIR ?? defaultInboxDir()),
   managedCloudflaredPath: resolve(
     process.env.MT_NODE_MANAGED_CLOUDFLARED_PATH ??
       resolve(process.env.MT_NODE_BIN_DIR ?? resolve(resolvedDataDir, "bin"), managedCloudflaredFileName(process.platform)),
@@ -327,6 +332,7 @@ const startedAt = new Date();
 
 mkdirSync(paths.dataDir, { recursive: true });
 mkdirSync(paths.binDir, { recursive: true });
+mkdirSync(paths.inboxDir, { recursive: true });
 const config = loadOrCreateConfig(paths.configPath, {
   nodeId: createId("mtn"),
   api: { host, port },
@@ -406,30 +412,44 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    if (req.method === "GET" && url.pathname === "/inbox") {
+      return sendJson(res, 200, {
+        ok: true,
+        inbox: {
+          directory: paths.inboxDir,
+          files: listInboxFiles(),
+        },
+      });
+    }
+
     if (req.method === "POST" && url.pathname === "/videos/register") {
-      const body = await readJsonBody(req);
-      const filePath = typeof body.filePath === "string" ? body.filePath.trim() : "";
-      if (!filePath) {
-        return sendJson(res, 400, { ok: false, error: "filePath is required." });
+      const body = (await readJsonBody(req)) as PublishRequestBody;
+      const selection = resolvePublishSourceSelection(body);
+      if (!selection.ok) {
+        return sendJson(res, selection.status, { ok: false, error: selection.error, ...(selection.details ?? {}) });
       }
 
-      const result = ensureRegisteredVideo(filePath);
+      const result = ensureRegisteredVideo(selection.filePath);
       if (!result.ok) {
         return sendJson(res, result.status, { ok: false, error: result.error, ...(result.details ?? {}) });
       }
 
       await tunnelManager.ensureStarted().catch(() => undefined);
-      return sendJson(res, result.created ? 201 : 200, { ok: true, video: toVideoResponse(result.video, req) });
+      return sendJson(res, result.created ? 201 : 200, {
+        ok: true,
+        selection: selection.selection,
+        video: toVideoResponse(result.video, req),
+      });
     }
 
     if (req.method === "POST" && url.pathname === "/publish") {
       const body = (await readJsonBody(req)) as PublishRequestBody;
-      const filePath = typeof body.filePath === "string" ? body.filePath.trim() : "";
-      if (!filePath) {
-        return sendJson(res, 400, { ok: false, error: "filePath is required." });
+      const selection = resolvePublishSourceSelection(body);
+      if (!selection.ok) {
+        return sendJson(res, selection.status, { ok: false, error: selection.error, ...(selection.details ?? {}) });
       }
 
-      const registerResult = ensureRegisteredVideo(filePath);
+      const registerResult = ensureRegisteredVideo(selection.filePath);
       if (!registerResult.ok) {
         return sendJson(res, registerResult.status, { ok: false, error: registerResult.error, ...(registerResult.details ?? {}) });
       }
@@ -447,6 +467,7 @@ const server = http.createServer(async (req, res) => {
       if (!publishToMachineTube) {
         return sendJson(res, registerResult.created ? 201 : 200, {
           ok: true,
+          selection: selection.selection,
           video: videoResponse,
           externalPlaybackUrl,
           machineTube: {
@@ -493,6 +514,7 @@ const server = http.createServer(async (req, res) => {
 
       return sendJson(res, registerResult.created ? 201 : 200, {
         ok: true,
+        selection: selection.selection,
         video: toVideoResponse(video, req),
         externalPlaybackUrl,
         machineTube: {
@@ -606,6 +628,127 @@ function ensureRegisteredVideo(filePath: string):
   videos.push(video);
   persistVideos();
   return { ok: true, video, created: true };
+}
+
+function resolvePublishSourceSelection(body: PublishRequestBody):
+  | { ok: true; filePath: string; selection: JsonRecord }
+  | { ok: false; status: number; error: string; details?: JsonRecord } {
+  const filePath = normalizeOptionalString(body.filePath);
+  if (filePath) {
+    return {
+      ok: true,
+      filePath,
+      selection: {
+        mode: "filePath",
+        filePath: resolve(filePath),
+      },
+    };
+  }
+
+  const inboxFileName = normalizeOptionalString(body.inboxFileName);
+  if (inboxFileName) {
+    const resolved = resolveInboxFilePath(inboxFileName);
+    if (!resolved.ok) {
+      return resolved;
+    }
+    return {
+      ok: true,
+      filePath: resolved.filePath,
+      selection: {
+        mode: "inboxFileName",
+        inboxDir: paths.inboxDir,
+        inboxFileName,
+        filePath: resolved.filePath,
+      },
+    };
+  }
+
+  if (body.useLatestInboxVideo === true) {
+    const latest = findLatestInboxVideo();
+    if (!latest.ok) {
+      return latest;
+    }
+    return {
+      ok: true,
+      filePath: latest.filePath,
+      selection: {
+        mode: "latestInboxVideo",
+        inboxDir: paths.inboxDir,
+        inboxFileName: latest.fileName,
+        filePath: latest.filePath,
+      },
+    };
+  }
+
+  return {
+    ok: false,
+    status: 400,
+    error: "Provide filePath, inboxFileName, or useLatestInboxVideo=true.",
+    details: { inboxDir: paths.inboxDir },
+  };
+}
+
+function listInboxFiles(): JsonRecord[] {
+  return readdirSync(paths.inboxDir, { withFileTypes: true })
+    .filter((entry) => entry.isFile())
+    .map((entry) => {
+      const filePath = resolve(paths.inboxDir, entry.name);
+      const stats = statSync(filePath);
+      return {
+        fileName: entry.name,
+        filePath,
+        bytes: stats.size,
+        modifiedAt: new Date(stats.mtimeMs).toISOString(),
+        mimeType: guessMimeType(filePath),
+      };
+    })
+    .filter((entry) => String(entry.mimeType) !== "application/octet-stream")
+    .sort((left, right) => String(right.modifiedAt).localeCompare(String(left.modifiedAt)));
+}
+
+function resolveInboxFilePath(fileName: string):
+  | { ok: true; filePath: string }
+  | { ok: false; status: number; error: string; details?: JsonRecord } {
+  const resolvedPath = resolve(paths.inboxDir, fileName);
+  if (!resolvedPath.startsWith(paths.inboxDir)) {
+    return {
+      ok: false,
+      status: 400,
+      error: "inboxFileName must stay within the MachineTube inbox folder.",
+      details: { inboxDir: paths.inboxDir, inboxFileName: fileName },
+    };
+  }
+
+  if (!existsSync(resolvedPath)) {
+    return {
+      ok: false,
+      status: 404,
+      error: "Inbox file not found.",
+      details: { inboxDir: paths.inboxDir, inboxFileName: fileName, filePath: resolvedPath },
+    };
+  }
+
+  return { ok: true, filePath: resolvedPath };
+}
+
+function findLatestInboxVideo():
+  | { ok: true; filePath: string; fileName: string }
+  | { ok: false; status: number; error: string; details?: JsonRecord } {
+  const files = listInboxFiles();
+  if (files.length === 0) {
+    return {
+      ok: false,
+      status: 404,
+      error: "No video files were found in the MachineTube inbox folder.",
+      details: { inboxDir: paths.inboxDir },
+    };
+  }
+
+  return {
+    ok: true,
+    filePath: String(files[0].filePath),
+    fileName: String(files[0].fileName),
+  };
 }
 
 function persistVideos(): void {
@@ -942,6 +1085,10 @@ function buildHeartbeatPayload(req: IncomingMessage): JsonRecord {
     originHealthUrl,
     publicBaseUrl: tunnel.publicBaseUrl,
     tunnel,
+    inbox: {
+      directory: paths.inboxDir,
+      availableFiles: listInboxFiles(),
+    },
     machineTube: {
       configured: hasCompleteMachineTubeCredentials(config.machineTube),
       baseUrl: config.machineTube.baseUrl || null,
@@ -1113,6 +1260,14 @@ function defaultTunnelTargetUrl(mode: TunnelMode, localPort: number): string {
     return `http://host.docker.internal:${localPort}`;
   }
   return `http://127.0.0.1:${localPort}`;
+}
+
+function defaultInboxDir(): string {
+  const homeDir = process.env.USERPROFILE?.trim() || process.env.HOME?.trim();
+  if (!homeDir) {
+    return resolve(process.cwd(), "MachineTube", "videos");
+  }
+  return resolve(homeDir, "MachineTube", "videos");
 }
 
 function managedCloudflaredFileName(platform: NodeJS.Platform): string {
