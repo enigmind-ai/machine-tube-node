@@ -38,10 +38,15 @@ type RegisteredVideo = {
   createdAt: string;
   machineTube: {
     lastPublishedAt: string | null;
+    lastSyncedAt: string | null;
+    lastSyncError: string | null;
     videoId: string | null;
     watchUrl: string | null;
     status: string | null;
     title: string | null;
+    externalPlaybackUrl: string | null;
+    externalThumbnailUrl: string | null;
+    sourceUrl: string | null;
   };
 };
 
@@ -474,10 +479,15 @@ const server = http.createServer(async (req, res) => {
 
       video.machineTube = {
         lastPublishedAt: new Date().toISOString(),
+        lastSyncedAt: new Date().toISOString(),
+        lastSyncError: null,
         videoId: publishResult.videoId,
         watchUrl: publishResult.watchUrl,
         status: publishResult.status,
         title,
+        externalPlaybackUrl,
+        externalThumbnailUrl: normalizeOptionalString(body.externalThumbnailUrl),
+        sourceUrl: normalizeOptionalString(body.sourceUrl) ?? `${tunnel.publicBaseUrl}/heartbeat`,
       };
       persistVideos();
 
@@ -534,10 +544,21 @@ server.listen(port, host, () => {
       console.error(`[mt-node] tunnel start failed: ${formatError(error)}`);
     });
   }
+  void syncPublishedVideoOrigins().catch((error) => {
+    console.error(`[mt-node] initial sync failed: ${formatError(error)}`);
+  });
 });
+
+const syncIntervalMs = parseNumber(process.env.MT_NODE_SYNC_INTERVAL_MS, 30000);
+const syncTimer = setInterval(() => {
+  void syncPublishedVideoOrigins().catch((error) => {
+    console.error(`[mt-node] sync loop failed: ${formatError(error)}`);
+  });
+}, syncIntervalMs);
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, () => {
+    clearInterval(syncTimer);
     tunnelManager.stop();
     server.close(() => process.exit(0));
   });
@@ -570,10 +591,15 @@ function ensureRegisteredVideo(filePath: string):
     createdAt: new Date().toISOString(),
     machineTube: {
       lastPublishedAt: null,
+      lastSyncedAt: null,
+      lastSyncError: null,
       videoId: null,
       watchUrl: null,
       status: null,
       title: null,
+      externalPlaybackUrl: null,
+      externalThumbnailUrl: null,
+      sourceUrl: null,
     },
   };
 
@@ -661,6 +687,100 @@ async function publishExternalVideoToMachineTube(input: {
     status: parsedBody.status,
     watchUrl,
   };
+}
+
+async function refreshExternalVideoOriginInMachineTube(input: {
+  credentials: MachineTubeCredentials;
+  videoId: string;
+  externalPlaybackUrl: string;
+  externalThumbnailUrl: string | null;
+  sourceUrl: string | null;
+}): Promise<void> {
+  const baseUrl = normalizeBaseUrl(input.credentials.baseUrl);
+  const response = await fetch(`${baseUrl}/api/videos/${input.videoId}/external-origin`, {
+    method: "PATCH",
+    headers: {
+      Authorization: `Bearer ${input.credentials.apiKey}`,
+      "X-Agent-Id": input.credentials.agentId,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      externalPlaybackUrl: input.externalPlaybackUrl,
+      externalThumbnailUrl: input.externalThumbnailUrl,
+      sourceUrl: input.sourceUrl,
+    }),
+  });
+
+  if (!response.ok) {
+    const rawBody = await response.text();
+    const parsedBody = rawBody ? tryParseJson(rawBody) : null;
+    const message =
+      parsedBody && typeof parsedBody.error === "string"
+        ? parsedBody.error
+        : `MachineTube origin refresh failed with ${response.status} ${response.statusText}.`;
+    throw new Error(message);
+  }
+}
+
+async function syncPublishedVideoOrigins(): Promise<void> {
+  if (!hasCompleteMachineTubeCredentials(config.machineTube)) {
+    return;
+  }
+
+  if (videos.every((video) => !video.machineTube.videoId)) {
+    return;
+  }
+
+  const tunnel = await tunnelManager.ensureStarted();
+  if (!tunnel.publicBaseUrl) {
+    return;
+  }
+
+  let changed = false;
+
+  for (const video of videos) {
+    if (!video.machineTube.videoId) {
+      continue;
+    }
+
+    const nextPlaybackUrl = `${tunnel.publicBaseUrl}/media/${encodeURIComponent(video.id)}`;
+    const nextSourceUrl = `${tunnel.publicBaseUrl}/heartbeat`;
+    const nextThumbnailUrl = video.machineTube.externalThumbnailUrl;
+
+    if (
+      video.machineTube.externalPlaybackUrl === nextPlaybackUrl &&
+      video.machineTube.sourceUrl === nextSourceUrl
+    ) {
+      if (video.machineTube.lastSyncError) {
+        video.machineTube.lastSyncError = null;
+        video.machineTube.lastSyncedAt = new Date().toISOString();
+        changed = true;
+      }
+      continue;
+    }
+
+    try {
+      await refreshExternalVideoOriginInMachineTube({
+        credentials: config.machineTube,
+        videoId: video.machineTube.videoId,
+        externalPlaybackUrl: nextPlaybackUrl,
+        externalThumbnailUrl: nextThumbnailUrl,
+        sourceUrl: nextSourceUrl,
+      });
+      video.machineTube.externalPlaybackUrl = nextPlaybackUrl;
+      video.machineTube.sourceUrl = nextSourceUrl;
+      video.machineTube.lastSyncedAt = new Date().toISOString();
+      video.machineTube.lastSyncError = null;
+      changed = true;
+    } catch (error) {
+      video.machineTube.lastSyncError = formatError(error);
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    persistVideos();
+  }
 }
 
 function resolvePublishIntent(value: unknown, credentials: MachineTubeCredentials): boolean {
@@ -790,10 +910,15 @@ function normalizeRegisteredVideo(value: unknown): RegisteredVideo | null {
     createdAt,
     machineTube: {
       lastPublishedAt: normalizeOptionalString(machineTube?.lastPublishedAt),
+      lastSyncedAt: normalizeOptionalString(machineTube?.lastSyncedAt),
+      lastSyncError: normalizeOptionalString(machineTube?.lastSyncError),
       videoId: normalizeOptionalString(machineTube?.videoId),
       watchUrl: normalizeOptionalString(machineTube?.watchUrl),
       status: normalizeOptionalString(machineTube?.status),
       title: normalizeOptionalString(machineTube?.title),
+      externalPlaybackUrl: normalizeOptionalString(machineTube?.externalPlaybackUrl),
+      externalThumbnailUrl: normalizeOptionalString(machineTube?.externalThumbnailUrl),
+      sourceUrl: normalizeOptionalString(machineTube?.sourceUrl),
     },
   };
 }
@@ -1039,7 +1164,14 @@ function resolveCloudflaredDownloadAsset(platform: NodeJS.Platform, arch: string
 
 function ensureExecutable(path: string): void {
   if (process.platform !== "win32") {
-    chmodSync(path, 0o755);
+    try {
+      chmodSync(path, 0o755);
+    } catch (error) {
+      const code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : "";
+      if (code !== "EPERM" && code !== "EROFS" && code !== "EINVAL") {
+        throw error;
+      }
+    }
   }
 }
 
