@@ -12,5 +12,6 @@ COPY --from=build /app/package.json ./package.json
 COPY --from=build /app/dist ./dist
 ENV MT_NODE_PORT=43110
 ENV MT_NODE_DATA_DIR=/data
+ENV MT_NODE_INBOX_DIR=/videos
 EXPOSE 43110
 CMD ["node", "dist/index.js"]

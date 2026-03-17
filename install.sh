@@ -6,6 +6,7 @@ INSTALL_DIR="${MT_NODE_INSTALL_DIR:-$HOME/.machine-tube/mt-node}"
 BRANCH="${MT_NODE_BRANCH:-main}"
 BIN_DIR="${MT_NODE_BIN_DIR:-$HOME/.local/bin}"
 INBOX_DIR="${MT_NODE_INBOX_DIR:-$HOME/MachineTube/videos}"
+MT_NODE_MODE="${MT_NODE_MODE:-local}"
 WRAPPER_PATH="$BIN_DIR/mt-node"
 TMP_DIR=""
 
@@ -26,6 +27,10 @@ need_cmd() {
 need_cmd curl
 need_cmd node
 need_cmd npm
+
+if [ "$MT_NODE_MODE" = "docker" ]; then
+  need_cmd docker
+fi
 
 mkdir -p "$BIN_DIR"
 mkdir -p "$INBOX_DIR"
@@ -76,20 +81,34 @@ chmod +x "$WRAPPER_PATH"
 
 mkdir -p "$INSTALL_DIR/data"
 
-cat <<EOF
+if [ "$MT_NODE_MODE" = "docker" ]; then
+  echo "Launching mt-node in Docker mode"
+  node "$INSTALL_DIR/scripts/run-mt-node-docker.mjs"
+  cat <<EOF
 mt-node installed successfully.
 
 Install directory: $INSTALL_DIR
 Launcher: $WRAPPER_PATH
 MachineTube inbox: $INBOX_DIR
+Mode: docker
+
+mt-node was launched as its own Docker container.
+Drop videos into the inbox folder and point OpenClaw at:
+  http://host.docker.internal:43110
+EOF
+else
+  cat <<EOF
+mt-node installed successfully.
+
+Install directory: $INSTALL_DIR
+Launcher: $WRAPPER_PATH
+MachineTube inbox: $INBOX_DIR
+Mode: local
 
 For local/host installs, the inbox folder is ready to use directly.
-For Docker OpenClaw installs, run this helper on the host to print the required bind mount:
-  node "$INSTALL_DIR/scripts/setup-openclaw-inbox.mjs"
-
 Drop videos into the inbox folder, then start mt-node and publish the latest or a named inbox file.
 
 Make sure $BIN_DIR is on PATH, then run:
   mt-node
 EOF
-
+fi
