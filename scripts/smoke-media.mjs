@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, "..");
 const distEntry = path.join(repoRoot, "dist", "index.js");
+const bootstrapEntry = path.join(repoRoot, "scripts", "bootstrap-media-tools.mjs");
 
 function runOrThrow(command, args, options = {}) {
   const result = spawnSync(command, args, {
@@ -66,8 +67,41 @@ async function main() {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), "mt-node-smoke-"));
   const dataDir = path.join(tempRoot, "data");
   const samplePath = path.join(tempRoot, "sample.mp4");
+  const ffmpegPath = path.join(dataDir, "bin", process.platform === "win32" ? "ffmpeg.exe" : "ffmpeg");
   const port = "43119";
   const baseUrl = `http://127.0.0.1:${port}`;
+
+  console.log("Preparing managed media tools...");
+  runOrThrow("node", [bootstrapEntry], {
+    cwd: repoRoot,
+    env: {
+      ...process.env,
+      MT_NODE_DATA_DIR: dataDir
+    }
+  });
+
+  console.log("Generating sample MP4 with managed ffmpeg...");
+  runOrThrow(ffmpegPath, [
+    "-hide_banner",
+    "-y",
+    "-f",
+    "lavfi",
+    "-i",
+    "testsrc=size=640x360:rate=30",
+    "-f",
+    "lavfi",
+    "-i",
+    "sine=frequency=1000",
+    "-t",
+    "3",
+    "-c:v",
+    "libx264",
+    "-pix_fmt",
+    "yuv420p",
+    "-c:a",
+    "aac",
+    samplePath,
+  ]);
 
   console.log("Starting mt-node with built-in thumbnail and HLS generation...");
   const server = spawn("node", [distEntry], {
@@ -93,37 +127,6 @@ async function main() {
 
   try {
     await waitFor(`${baseUrl}/healthz`, 15000);
-
-    const bootstrapPayload = await fetchJson(`${baseUrl}/bootstrap/ffmpeg`, {
-      method: "POST",
-    });
-    const ffmpegPath = bootstrapPayload?.mediaTools?.ffmpegPath;
-    if (typeof ffmpegPath !== "string" || ffmpegPath.length === 0) {
-      throw new Error(`Unexpected FFmpeg bootstrap payload: ${JSON.stringify(bootstrapPayload, null, 2)}`);
-    }
-
-    console.log("Generating sample MP4 with managed ffmpeg...");
-    runOrThrow(ffmpegPath, [
-      "-hide_banner",
-      "-y",
-      "-f",
-      "lavfi",
-      "-i",
-      "testsrc=size=640x360:rate=30",
-      "-f",
-      "lavfi",
-      "-i",
-      "sine=frequency=1000",
-      "-t",
-      "3",
-      "-c:v",
-      "libx264",
-      "-pix_fmt",
-      "yuv420p",
-      "-c:a",
-      "aac",
-      samplePath,
-    ]);
 
     const registerPayload = await fetchJson(`${baseUrl}/videos/register`, {
       method: "POST",

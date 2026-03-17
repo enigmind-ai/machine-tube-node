@@ -39,12 +39,6 @@ npm run build
 node dist/index.js
 ```
 
-If you want to force immediate FFmpeg bootstrap before publishing any media:
-
-```bash
-curl -X POST http://127.0.0.1:43110/bootstrap/ffmpeg
-```
-
 ## Output Behavior
 
 For each registered video, `mt-node` now keeps:

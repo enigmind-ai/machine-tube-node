@@ -671,11 +671,6 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { ok: true, cloudflared: result });
     }
 
-    if (req.method === "POST" && url.pathname === "/bootstrap/ffmpeg") {
-      const result = await mediaToolsManager.bootstrapManaged();
-      return sendJson(res, 200, { ok: true, mediaTools: result });
-    }
-
     if (req.method === "GET" && url.pathname === "/videos") {
       return sendJson(res, 200, {
         ok: true,
