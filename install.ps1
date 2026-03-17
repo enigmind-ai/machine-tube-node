@@ -66,6 +66,9 @@ if (Test-Path (Join-Path $InstallDir "package-lock.json")) {
 Write-Host "Building mt-node"
 npm run build
 
+Write-Host "Preparing managed media tools"
+node "$InstallDir\scripts\bootstrap-media-tools.mjs"
+
 # Create a .cmd wrapper so `mt-node` works from any terminal
 @"
 @echo off
@@ -96,6 +99,9 @@ Mode: docker
 mt-node was launched as its own Docker container.
 Drop videos into the inbox folder and point OpenClaw at:
   http://localhost:43110
+
+For built-in thumbnail and HLS output, mt-node can manage FFmpeg itself. See:
+  $InstallDir\README.md
 "@
 } else {
     Write-Host @"
@@ -108,6 +114,9 @@ MachineTube inbox: $InboxDir
 Mode: local
 
 Drop videos into the inbox folder, then start mt-node and publish the latest or a named inbox file.
+
+For built-in thumbnail and HLS output, mt-node can manage FFmpeg itself. See:
+  $InstallDir\README.md
 
 Restart your terminal, then run:
   mt-node

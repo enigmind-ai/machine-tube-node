@@ -1,18 +1,21 @@
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
-import { spawn, type ChildProcessByStdio } from "node:child_process";
+import { spawn, spawnSync, type ChildProcessByStdio } from "node:child_process";
 import {
   chmodSync,
+  copyFileSync,
   createReadStream,
   existsSync,
   mkdirSync,
   readFileSync,
   readdirSync,
+  rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, extname, resolve } from "node:path";
 import type { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
+import { generateThumbnail, probeVideo, transcodeToHls, type MediaToolPaths, type VideoProbe } from "./media.js";
 
 type MachineTubeCredentials = {
   baseUrl: string;
@@ -37,6 +40,13 @@ type RegisteredVideo = {
   mimeType: string;
   bytes: number;
   createdAt: string;
+  outputs: {
+    probe: VideoProbe | null;
+    thumbnail: GeneratedAsset | null;
+    hls: GeneratedHlsOutput | null;
+    lastPreparedAt: string | null;
+    lastPreparationError: string | null;
+  };
   machineTube: {
     lastPublishedAt: string | null;
     lastSyncedAt: string | null;
@@ -46,6 +56,7 @@ type RegisteredVideo = {
     status: string | null;
     title: string | null;
     externalPlaybackUrl: string | null;
+    externalPlaybackHlsUrl: string | null;
     externalThumbnailUrl: string | null;
     sourceUrl: string | null;
   };
@@ -58,6 +69,7 @@ type RuntimePaths = {
   videosPath: string;
   binDir: string;
   inboxDir: string;
+  outputsDir: string;
   managedCloudflaredPath: string;
 };
 
@@ -82,6 +94,24 @@ type CloudflaredBootstrapResult = {
   downloadUrl: string | null;
 };
 
+type MediaBootstrapResult = {
+  ffmpegPath: string;
+  ffprobePath: string;
+  managed: boolean;
+  downloadUrl: string | null;
+};
+
+type MediaToolsSnapshot = {
+  status: "unknown" | "ready" | "error";
+  source: "env" | "managed" | "path" | null;
+  ffmpegPath: string | null;
+  ffprobePath: string | null;
+  managed: boolean;
+  lastReadyAt: string | null;
+  lastError: string | null;
+  downloadUrl: string | null;
+};
+
 type PublishRequestBody = {
   filePath?: unknown;
   inboxFileName?: unknown;
@@ -94,6 +124,27 @@ type PublishRequestBody = {
   externalThumbnailUrl?: unknown;
   publishToMachineTube?: unknown;
   machineTube?: unknown;
+};
+
+type GeneratedAsset = {
+  localPath: string;
+  bytes: number;
+  mimeType: string;
+  generatedAt: string;
+};
+
+type GeneratedHlsFile = {
+  localPath: string;
+  relativePath: string;
+  bytes: number;
+  mimeType: string;
+};
+
+type GeneratedHlsOutput = {
+  rootDirectory: string;
+  playlist: GeneratedHlsFile;
+  files: GeneratedHlsFile[];
+  generatedAt: string;
 };
 
 type MachineTubePublishResult = {
@@ -116,6 +167,197 @@ type InboxAvailability = {
   mountPoint: string | null;
   mountSource: string | null;
 };
+
+class MediaToolsManager {
+  private readonly managedFfmpegPath: string;
+  private readonly managedFfprobePath: string;
+  private pendingBootstrap: Promise<MediaBootstrapResult> | null = null;
+  private snapshot: MediaToolsSnapshot = {
+    status: "unknown",
+    source: null,
+    ffmpegPath: null,
+    ffprobePath: null,
+    managed: false,
+    lastReadyAt: null,
+    lastError: null,
+    downloadUrl: null,
+  };
+
+  constructor(binDir: string) {
+    this.managedFfmpegPath = resolve(binDir, managedMediaToolFileName("ffmpeg", process.platform));
+    this.managedFfprobePath = resolve(binDir, managedMediaToolFileName("ffprobe", process.platform));
+  }
+
+  getSnapshot(): MediaToolsSnapshot {
+    return { ...this.snapshot };
+  }
+
+  async ensureReady(): Promise<MediaToolPaths> {
+    if (this.snapshot.status === "ready" && this.snapshot.ffmpegPath && this.snapshot.ffprobePath) {
+      return {
+        ffmpegPath: this.snapshot.ffmpegPath,
+        ffprobePath: this.snapshot.ffprobePath,
+      };
+    }
+
+    const managed = this.tryResolveKnownPair(this.managedFfmpegPath, this.managedFfprobePath, "managed", true, null);
+    if (managed) {
+      return managed;
+    }
+
+    const bootstrapped = await this.bootstrapManaged();
+    return {
+      ffmpegPath: bootstrapped.ffmpegPath,
+      ffprobePath: bootstrapped.ffprobePath,
+    };
+  }
+
+  async bootstrapManaged(): Promise<MediaBootstrapResult> {
+    const managed = this.tryResolveKnownPair(this.managedFfmpegPath, this.managedFfprobePath, "managed", true, null);
+    if (managed) {
+      return {
+        ffmpegPath: managed.ffmpegPath,
+        ffprobePath: managed.ffprobePath,
+        managed: true,
+        downloadUrl: null,
+      };
+    }
+
+    if (this.pendingBootstrap) {
+      return this.pendingBootstrap;
+    }
+
+    this.pendingBootstrap = this.bootstrapManagedInternal();
+    try {
+      return await this.pendingBootstrap;
+    } finally {
+      this.pendingBootstrap = null;
+    }
+  }
+
+  private async bootstrapManagedInternal(): Promise<MediaBootstrapResult> {
+    const asset = resolveMediaToolsDownloadAsset(process.platform, process.arch);
+    const archivePath = resolve(dirname(this.managedFfmpegPath), asset.archiveFileName);
+    const extractDir = resolve(dirname(this.managedFfmpegPath), `extract-${Date.now()}`);
+
+    mkdirSync(dirname(this.managedFfmpegPath), { recursive: true });
+    mkdirSync(extractDir, { recursive: true });
+
+    try {
+      const ffmpegFromPath = resolveExecutableOnPath(managedMediaToolFileName("ffmpeg", process.platform), "ffmpeg");
+      const ffprobeFromPath = resolveExecutableOnPath(managedMediaToolFileName("ffprobe", process.platform), "ffprobe");
+      if (ffmpegFromPath && ffprobeFromPath) {
+        copyFileSync(ffmpegFromPath, this.managedFfmpegPath);
+        copyFileSync(ffprobeFromPath, this.managedFfprobePath);
+        ensureExecutable(this.managedFfmpegPath);
+        ensureExecutable(this.managedFfprobePath);
+
+        const resolved = this.tryResolveKnownPair(
+          this.managedFfmpegPath,
+          this.managedFfprobePath,
+          "managed",
+          true,
+          null,
+        );
+        if (!resolved) {
+          throw new Error("Managed FFmpeg binaries copied from PATH could not be executed.");
+        }
+
+        return {
+          ffmpegPath: resolved.ffmpegPath,
+          ffprobePath: resolved.ffprobePath,
+          managed: true,
+          downloadUrl: null,
+        };
+      }
+
+      const response = await fetch(asset.url);
+      if (!response.ok) {
+        throw new Error(`Failed to download FFmpeg tools from ${asset.url}: ${response.status} ${response.statusText}`);
+      }
+
+      const bytes = Buffer.from(await response.arrayBuffer());
+      writeFileSync(archivePath, bytes);
+      extractArchive(archivePath, extractDir, asset.archiveType);
+
+      const ffmpegCandidate = findFileRecursive(extractDir, managedMediaToolFileName("ffmpeg", process.platform));
+      const ffprobeCandidate = findFileRecursive(extractDir, managedMediaToolFileName("ffprobe", process.platform));
+      if (!ffmpegCandidate || !ffprobeCandidate) {
+        throw new Error("Downloaded FFmpeg archive did not include both ffmpeg and ffprobe executables.");
+      }
+
+      copyFileSync(ffmpegCandidate, this.managedFfmpegPath);
+      copyFileSync(ffprobeCandidate, this.managedFfprobePath);
+      ensureExecutable(this.managedFfmpegPath);
+      ensureExecutable(this.managedFfprobePath);
+
+      const resolved = this.tryResolveKnownPair(
+        this.managedFfmpegPath,
+        this.managedFfprobePath,
+        "managed",
+        true,
+        asset.url,
+      );
+      if (!resolved) {
+        throw new Error("Managed FFmpeg binaries were downloaded but could not be executed.");
+      }
+
+      return {
+        ffmpegPath: resolved.ffmpegPath,
+        ffprobePath: resolved.ffprobePath,
+        managed: true,
+        downloadUrl: asset.url,
+      };
+    } catch (error) {
+      this.snapshot = {
+        ...this.snapshot,
+        status: "error",
+        source: null,
+        managed: false,
+        ffmpegPath: null,
+        ffprobePath: null,
+        lastError: formatError(error),
+        downloadUrl: asset.url,
+      };
+      throw error;
+    } finally {
+      try {
+        rmSync(archivePath, { force: true });
+      } catch {
+        // ignore cleanup failure
+      }
+      try {
+        rmSync(extractDir, { recursive: true, force: true });
+      } catch {
+        // ignore cleanup failure
+      }
+    }
+  }
+
+  private tryResolveKnownPair(
+    ffmpegPath: string,
+    ffprobePath: string,
+    source: "env" | "managed" | "path",
+    managed: boolean,
+    downloadUrl: string | null,
+  ): MediaToolPaths | null {
+    if (!canRunExecutable(ffmpegPath, ["-version"]) || !canRunExecutable(ffprobePath, ["-version"])) {
+      return null;
+    }
+
+    this.snapshot = {
+      status: "ready",
+      source,
+      ffmpegPath,
+      ffprobePath,
+      managed,
+      lastReadyAt: new Date().toISOString(),
+      lastError: null,
+      downloadUrl,
+    };
+    return { ffmpegPath, ffprobePath };
+  }
+}
 
 class TunnelManager {
   private readonly mode: TunnelMode;
@@ -334,6 +576,7 @@ const paths: RuntimePaths = {
   videosPath: resolve(process.env.MT_NODE_VIDEOS_PATH ?? resolve(resolvedDataDir, "videos.json")),
   binDir: resolve(process.env.MT_NODE_BIN_DIR ?? resolve(resolvedDataDir, "bin")),
   inboxDir: resolve(process.env.MT_NODE_INBOX_DIR ?? defaultInboxDir()),
+  outputsDir: resolve(resolvedDataDir, "outputs"),
   managedCloudflaredPath: resolve(
     process.env.MT_NODE_MANAGED_CLOUDFLARED_PATH ??
       resolve(process.env.MT_NODE_BIN_DIR ?? resolve(resolvedDataDir, "bin"), managedCloudflaredFileName(process.platform)),
@@ -348,6 +591,7 @@ const runtimeEnvironment = detectRuntimeEnvironment();
 mkdirSync(paths.dataDir, { recursive: true });
 mkdirSync(paths.binDir, { recursive: true });
 mkdirSync(paths.inboxDir, { recursive: true });
+mkdirSync(paths.outputsDir, { recursive: true });
 const config = loadOrCreateConfig(paths.configPath, {
   nodeId: createId("mtn"),
   api: { host, port },
@@ -360,6 +604,7 @@ const config = loadOrCreateConfig(paths.configPath, {
 });
 const videos = loadOrCreateVideos(paths.videosPath);
 const tunnelManager = new TunnelManager(port, paths.managedCloudflaredPath);
+const mediaToolsManager = new MediaToolsManager(paths.binDir);
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
@@ -384,6 +629,7 @@ const server = http.createServer(async (req, res) => {
         publishedVideoCount: countPublishedMachineTubeVideos(),
         runtime: runtimeEnvironment,
         tunnel: tunnelManager.getSnapshot(),
+        mediaTools: mediaToolsManager.getSnapshot(),
         inbox: {
           availability: evaluateInboxAvailability(paths.inboxDir, runtimeEnvironment),
           files: listInboxFiles(),
@@ -425,6 +671,11 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { ok: true, cloudflared: result });
     }
 
+    if (req.method === "POST" && url.pathname === "/bootstrap/ffmpeg") {
+      const result = await mediaToolsManager.bootstrapManaged();
+      return sendJson(res, 200, { ok: true, mediaTools: result });
+    }
+
     if (req.method === "GET" && url.pathname === "/videos") {
       return sendJson(res, 200, {
         ok: true,
@@ -449,7 +700,7 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, selection.status, { ok: false, error: selection.error, ...(selection.details ?? {}) });
       }
 
-      const result = ensureRegisteredVideo(selection.filePath);
+      const result = await ensureRegisteredVideo(selection.filePath);
       if (!result.ok) {
         return sendJson(res, result.status, { ok: false, error: result.error, ...(result.details ?? {}) });
       }
@@ -469,7 +720,7 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, selection.status, { ok: false, error: selection.error, ...(selection.details ?? {}) });
       }
 
-      const registerResult = ensureRegisteredVideo(selection.filePath);
+      const registerResult = await ensureRegisteredVideo(selection.filePath);
       if (!registerResult.ok) {
         return sendJson(res, registerResult.status, { ok: false, error: registerResult.error, ...(registerResult.details ?? {}) });
       }
@@ -482,6 +733,11 @@ const server = http.createServer(async (req, res) => {
       const video = registerResult.video;
       const videoResponse = toVideoResponse(video, req);
       const externalPlaybackUrl = String(videoResponse.playbackUrl);
+      const externalPlaybackHlsUrl =
+        typeof videoResponse.hlsPlaybackUrl === "string" ? videoResponse.hlsPlaybackUrl : null;
+      const externalThumbnailUrl =
+        normalizeOptionalString(body.externalThumbnailUrl) ??
+        (typeof videoResponse.thumbnailUrl === "string" ? videoResponse.thumbnailUrl : null);
       const publishToMachineTube = resolvePublishIntent(body.publishToMachineTube, config.machineTube);
 
       if (!publishToMachineTube) {
@@ -490,6 +746,8 @@ const server = http.createServer(async (req, res) => {
           selection: selection.selection,
           video: videoResponse,
           externalPlaybackUrl,
+          externalPlaybackHlsUrl,
+          externalThumbnailUrl,
           machineTube: {
             published: false,
             reason: "MachineTube publish skipped. Credentials are not configured or publishToMachineTube was disabled.",
@@ -510,7 +768,8 @@ const server = http.createServer(async (req, res) => {
       const publishResult = await publishExternalVideoToMachineTube({
         credentials: credentialsResult.credentials,
         externalPlaybackUrl,
-        externalThumbnailUrl: normalizeOptionalString(body.externalThumbnailUrl),
+        externalPlaybackHlsUrl,
+        externalThumbnailUrl,
         title,
         description: typeof body.description === "string" ? body.description.trim() : "",
         tags: normalizeTags(body.tags),
@@ -527,7 +786,8 @@ const server = http.createServer(async (req, res) => {
         status: publishResult.status,
         title,
         externalPlaybackUrl,
-        externalThumbnailUrl: normalizeOptionalString(body.externalThumbnailUrl),
+        externalPlaybackHlsUrl,
+        externalThumbnailUrl,
         sourceUrl: normalizeOptionalString(body.sourceUrl) ?? `${tunnel.publicBaseUrl}/heartbeat`,
       };
       persistVideos();
@@ -537,6 +797,8 @@ const server = http.createServer(async (req, res) => {
         selection: selection.selection,
         video: toVideoResponse(video, req),
         externalPlaybackUrl,
+        externalPlaybackHlsUrl,
+        externalThumbnailUrl,
         machineTube: {
           published: true,
           videoId: publishResult.videoId,
@@ -556,12 +818,31 @@ const server = http.createServer(async (req, res) => {
     }
 
     if ((req.method === "GET" || req.method === "HEAD") && url.pathname.startsWith("/media/")) {
-      const videoId = decodeURIComponent(url.pathname.slice("/media/".length));
-      const video = videos.find((item) => item.id === videoId);
-      if (!video) {
-        return sendJson(res, 404, { ok: false, error: "Video not found.", videoId });
+      const resolvedMedia = resolveMediaRequest(url.pathname);
+      if (!resolvedMedia) {
+        return sendJson(res, 404, {
+          ok: false,
+          error: "Not found.",
+          method: req.method,
+          path: url.pathname,
+        });
       }
-      return serveVideo(req, res, video);
+
+      const video = videos.find((item) => item.id === resolvedMedia.videoId);
+      if (!video) {
+        return sendJson(res, 404, { ok: false, error: "Video not found.", videoId: resolvedMedia.videoId });
+      }
+
+      if (resolvedMedia.kind === "raw") {
+        return serveVideo(req, res, video);
+      }
+
+      const asset = resolvedMedia.kind === "thumbnail" ? video.outputs.thumbnail : findHlsFile(video, resolvedMedia.relativePath);
+      if (!asset) {
+        return sendJson(res, 404, { ok: false, error: "Media output not found.", videoId: resolvedMedia.videoId });
+      }
+
+      return serveStaticAsset(req, res, asset);
     }
 
     return sendJson(res, 404, {
@@ -586,6 +867,12 @@ server.listen(port, host, () => {
       console.error(`[mt-node] tunnel start failed: ${formatError(error)}`);
     });
   }
+  void mediaToolsManager.bootstrapManaged().catch((error) => {
+    console.error(`[mt-node] media tools bootstrap failed: ${formatError(error)}`);
+  });
+  void prepareRegisteredVideos().catch((error) => {
+    console.error(`[mt-node] initial media preparation failed: ${formatError(error)}`);
+  });
   void syncPublishedVideoOrigins().catch((error) => {
     console.error(`[mt-node] initial sync failed: ${formatError(error)}`);
   });
@@ -606,9 +893,8 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
   });
 }
 
-function ensureRegisteredVideo(filePath: string):
-  | { ok: true; video: RegisteredVideo; created: boolean }
-  | { ok: false; status: number; error: string; details?: JsonRecord } {
+async function ensureRegisteredVideo(filePath: string):
+  Promise<{ ok: true; video: RegisteredVideo; created: boolean } | { ok: false; status: number; error: string; details?: JsonRecord }> {
   const absoluteFilePath = resolve(filePath);
   if (!existsSync(absoluteFilePath)) {
     return { ok: false, status: 404, error: "File does not exist.", details: { filePath: absoluteFilePath } };
@@ -621,6 +907,11 @@ function ensureRegisteredVideo(filePath: string):
 
   const existing = videos.find((video) => video.filePath === absoluteFilePath);
   if (existing) {
+    existing.fileName = absoluteFilePath.split(/[\\/]/).pop() || existing.fileName;
+    existing.mimeType = guessMimeType(absoluteFilePath);
+    existing.bytes = fileStat.size;
+    await ensureVideoOutputs(existing);
+    persistVideos();
     return { ok: true, video: existing, created: false };
   }
 
@@ -631,6 +922,13 @@ function ensureRegisteredVideo(filePath: string):
     mimeType: guessMimeType(absoluteFilePath),
     bytes: fileStat.size,
     createdAt: new Date().toISOString(),
+    outputs: {
+      probe: null,
+      thumbnail: null,
+      hls: null,
+      lastPreparedAt: null,
+      lastPreparationError: null,
+    },
     machineTube: {
       lastPublishedAt: null,
       lastSyncedAt: null,
@@ -640,11 +938,13 @@ function ensureRegisteredVideo(filePath: string):
       status: null,
       title: null,
       externalPlaybackUrl: null,
+      externalPlaybackHlsUrl: null,
       externalThumbnailUrl: null,
       sourceUrl: null,
     },
   };
 
+  await ensureVideoOutputs(video);
   videos.push(video);
   persistVideos();
   return { ok: true, video, created: true };
@@ -797,7 +1097,25 @@ function persistVideos(): void {
 }
 
 function toVideoResponse(video: RegisteredVideo, req: IncomingMessage): JsonRecord {
-  const publicBaseUrl = tunnelManager.getSnapshot().publicBaseUrl;
+  const urls = resolveVideoOutputUrls(video, req);
+  const playbackFormats: JsonRecord[] = [
+    {
+      format: "mp4",
+      url: urls.playbackUrl,
+      mimeType: video.mimeType,
+      preferred: urls.hlsPlaybackUrl === null,
+    },
+  ];
+
+  if (urls.hlsPlaybackUrl) {
+    playbackFormats.unshift({
+      format: "hls",
+      url: urls.hlsPlaybackUrl,
+      mimeType: "application/vnd.apple.mpegurl",
+      preferred: true,
+    });
+  }
+
   return {
     id: video.id,
     filePath: video.filePath,
@@ -805,12 +1123,203 @@ function toVideoResponse(video: RegisteredVideo, req: IncomingMessage): JsonReco
     mimeType: video.mimeType,
     bytes: video.bytes,
     createdAt: video.createdAt,
-    playbackUrl: publicBaseUrl
-      ? `${publicBaseUrl}/media/${encodeURIComponent(video.id)}`
-      : buildLocalUrl(req, `/media/${encodeURIComponent(video.id)}`),
+    playbackUrl: urls.playbackUrl,
+    preferredPlaybackUrl: urls.preferredPlaybackUrl,
+    hlsPlaybackUrl: urls.hlsPlaybackUrl,
+    thumbnailUrl: urls.thumbnailUrl,
+    playbackFormats,
+    metadata: {
+      durationSeconds: video.outputs.probe?.durationSeconds ?? null,
+      width: video.outputs.probe?.width ?? null,
+      height: video.outputs.probe?.height ?? null,
+    },
+    outputs: {
+      thumbnail: video.outputs.thumbnail
+        ? {
+            url: urls.thumbnailUrl,
+            mimeType: video.outputs.thumbnail.mimeType,
+            bytes: video.outputs.thumbnail.bytes,
+            generatedAt: video.outputs.thumbnail.generatedAt,
+          }
+        : null,
+      hls: video.outputs.hls
+        ? {
+            playlistUrl: urls.hlsPlaybackUrl,
+            mimeType: "application/vnd.apple.mpegurl",
+            generatedAt: video.outputs.hls.generatedAt,
+          }
+        : null,
+      lastPreparedAt: video.outputs.lastPreparedAt,
+      lastPreparationError: video.outputs.lastPreparationError,
+    },
     statusUrl: buildLocalUrl(req, `/videos/${encodeURIComponent(video.id)}`),
     machineTube: video.machineTube,
   };
+}
+
+async function ensureVideoOutputs(video: RegisteredVideo): Promise<void> {
+  const outputDirectory = resolve(paths.outputsDir, video.id);
+  mkdirSync(outputDirectory, { recursive: true });
+
+  const issues: string[] = [];
+  let probe = video.outputs.probe;
+  let mediaTools: MediaToolPaths | null = null;
+
+  try {
+    mediaTools = await mediaToolsManager.ensureReady();
+  } catch (error) {
+    issues.push(`media tools unavailable: ${formatError(error)}`);
+  }
+
+  if (!probe && mediaTools) {
+    try {
+      probe = await probeVideo(video.filePath, mediaTools);
+    } catch (error) {
+      issues.push(`ffprobe failed: ${formatError(error)}`);
+    }
+  }
+
+  let thumbnail = video.outputs.thumbnail;
+  if (mediaTools && (!thumbnail || !existsSync(thumbnail.localPath))) {
+    const thumbnailPath = resolve(outputDirectory, "thumbnail.jpg");
+    try {
+      const timestampSeconds = resolveThumbnailTimestamp(probe);
+      await generateThumbnail(video.filePath, thumbnailPath, timestampSeconds, mediaTools);
+      const fileStat = statSync(thumbnailPath);
+      thumbnail = {
+        localPath: thumbnailPath,
+        bytes: fileStat.size,
+        mimeType: "image/jpeg",
+        generatedAt: new Date().toISOString(),
+      };
+    } catch (error) {
+      issues.push(`thumbnail generation failed: ${formatError(error)}`);
+    }
+  }
+
+  let hls = video.outputs.hls;
+  if (mediaTools && (!hls || !existsSync(hls.playlist.localPath))) {
+    const hlsDirectory = resolve(outputDirectory, "hls");
+    try {
+      const generatedFiles = await transcodeToHls(video.filePath, hlsDirectory, mediaTools);
+      const files = generatedFiles.map((file) => ({
+        localPath: file.localPath,
+        relativePath: file.relativePath,
+        bytes: file.bytes,
+        mimeType: guessMimeType(file.localPath),
+      }));
+      const playlist = files.find((file) => file.relativePath === "index.m3u8");
+      if (!playlist) {
+        throw new Error("HLS output did not include index.m3u8.");
+      }
+      hls = {
+        rootDirectory: hlsDirectory,
+        playlist,
+        files,
+        generatedAt: new Date().toISOString(),
+      };
+    } catch (error) {
+      issues.push(`HLS generation failed: ${formatError(error)}`);
+    }
+  }
+
+  video.outputs = {
+    probe,
+    thumbnail,
+    hls,
+    lastPreparedAt: new Date().toISOString(),
+    lastPreparationError: issues.length > 0 ? issues.join(" | ") : null,
+  };
+}
+
+function resolveThumbnailTimestamp(probe: VideoProbe | null): number {
+  if (!probe?.durationSeconds || probe.durationSeconds <= 0) {
+    return 1;
+  }
+
+  return Math.max(1, Math.min(Math.round(probe.durationSeconds * 0.1), probe.durationSeconds - 1));
+}
+
+function resolveVideoOutputUrls(
+  video: RegisteredVideo,
+  req: IncomingMessage,
+): { playbackUrl: string; preferredPlaybackUrl: string; hlsPlaybackUrl: string | null; thumbnailUrl: string | null } {
+  const playbackPath = `/media/${encodeURIComponent(video.id)}`;
+  const hlsPath = video.outputs.hls ? `/media/${encodeURIComponent(video.id)}/hls/index.m3u8` : null;
+  const thumbnailPath = video.outputs.thumbnail ? `/media/${encodeURIComponent(video.id)}/thumbnail.jpg` : null;
+  const tunnel = tunnelManager.getSnapshot();
+
+  const playbackUrl = tunnel.publicBaseUrl ? `${tunnel.publicBaseUrl}${playbackPath}` : buildLocalUrl(req, playbackPath);
+  const hlsPlaybackUrl = hlsPath ? (tunnel.publicBaseUrl ? `${tunnel.publicBaseUrl}${hlsPath}` : buildLocalUrl(req, hlsPath)) : null;
+  const thumbnailUrl = thumbnailPath
+    ? tunnel.publicBaseUrl
+      ? `${tunnel.publicBaseUrl}${thumbnailPath}`
+      : buildLocalUrl(req, thumbnailPath)
+    : null;
+
+  return {
+    playbackUrl,
+    preferredPlaybackUrl: hlsPlaybackUrl ?? playbackUrl,
+    hlsPlaybackUrl,
+    thumbnailUrl,
+  };
+}
+
+function resolveMediaRequest(pathname: string):
+  | { kind: "raw"; videoId: string }
+  | { kind: "thumbnail"; videoId: string }
+  | { kind: "hls"; videoId: string; relativePath: string }
+  | null {
+  const hlsMatch = /^\/media\/([^/]+)\/hls\/(.+)$/.exec(pathname);
+  if (hlsMatch) {
+    return {
+      kind: "hls",
+      videoId: decodeURIComponent(hlsMatch[1]),
+      relativePath: decodeURIComponent(hlsMatch[2]),
+    };
+  }
+
+  const thumbnailMatch = /^\/media\/([^/]+)\/thumbnail\.jpg$/.exec(pathname);
+  if (thumbnailMatch) {
+    return {
+      kind: "thumbnail",
+      videoId: decodeURIComponent(thumbnailMatch[1]),
+    };
+  }
+
+  const rawMatch = /^\/media\/([^/]+)$/.exec(pathname);
+  if (rawMatch) {
+    return {
+      kind: "raw",
+      videoId: decodeURIComponent(rawMatch[1]),
+    };
+  }
+
+  return null;
+}
+
+function findHlsFile(video: RegisteredVideo, relativePath: string): GeneratedHlsFile | null {
+  if (!video.outputs.hls) {
+    return null;
+  }
+
+  return video.outputs.hls.files.find((file) => file.relativePath === relativePath) ?? null;
+}
+
+async function prepareRegisteredVideos(): Promise<void> {
+  let changed = false;
+
+  for (const video of videos) {
+    const previousOutputs = JSON.stringify(video.outputs);
+    await ensureVideoOutputs(video);
+    if (JSON.stringify(video.outputs) !== previousOutputs) {
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    persistVideos();
+  }
 }
 
 function buildLocalUrl(req: IncomingMessage, path: string): string {
@@ -821,6 +1330,7 @@ function buildLocalUrl(req: IncomingMessage, path: string): string {
 async function publishExternalVideoToMachineTube(input: {
   credentials: MachineTubeCredentials;
   externalPlaybackUrl: string;
+  externalPlaybackHlsUrl: string | null;
   externalThumbnailUrl: string | null;
   title: string;
   description: string;
@@ -839,6 +1349,7 @@ async function publishExternalVideoToMachineTube(input: {
     body: JSON.stringify({
       deliveryMode: "external",
       externalPlaybackUrl: input.externalPlaybackUrl,
+      externalPlaybackHlsUrl: input.externalPlaybackHlsUrl,
       externalThumbnailUrl: input.externalThumbnailUrl,
       title: input.title,
       description: input.description,
@@ -877,6 +1388,7 @@ async function refreshExternalVideoOriginInMachineTube(input: {
   credentials: MachineTubeCredentials;
   videoId: string;
   externalPlaybackUrl: string;
+  externalPlaybackHlsUrl: string | null;
   externalThumbnailUrl: string | null;
   sourceUrl: string | null;
 }): Promise<void> {
@@ -890,6 +1402,7 @@ async function refreshExternalVideoOriginInMachineTube(input: {
     },
     body: JSON.stringify({
       externalPlaybackUrl: input.externalPlaybackUrl,
+      externalPlaybackHlsUrl: input.externalPlaybackHlsUrl,
       externalThumbnailUrl: input.externalThumbnailUrl,
       sourceUrl: input.sourceUrl,
     }),
@@ -928,11 +1441,16 @@ async function syncPublishedVideoOrigins(): Promise<void> {
     }
 
     const nextPlaybackUrl = `${tunnel.publicBaseUrl}/media/${encodeURIComponent(video.id)}`;
+    const nextPlaybackHlsUrl = video.outputs.hls ? `${tunnel.publicBaseUrl}/media/${encodeURIComponent(video.id)}/hls/index.m3u8` : null;
     const nextSourceUrl = `${tunnel.publicBaseUrl}/heartbeat`;
-    const nextThumbnailUrl = video.machineTube.externalThumbnailUrl;
+    const nextThumbnailUrl = video.outputs.thumbnail
+      ? `${tunnel.publicBaseUrl}/media/${encodeURIComponent(video.id)}/thumbnail.jpg`
+      : video.machineTube.externalThumbnailUrl;
 
     if (
       video.machineTube.externalPlaybackUrl === nextPlaybackUrl &&
+      video.machineTube.externalPlaybackHlsUrl === nextPlaybackHlsUrl &&
+      video.machineTube.externalThumbnailUrl === nextThumbnailUrl &&
       video.machineTube.sourceUrl === nextSourceUrl
     ) {
       if (video.machineTube.lastSyncError) {
@@ -948,10 +1466,13 @@ async function syncPublishedVideoOrigins(): Promise<void> {
         credentials: config.machineTube,
         videoId: video.machineTube.videoId,
         externalPlaybackUrl: nextPlaybackUrl,
+        externalPlaybackHlsUrl: nextPlaybackHlsUrl,
         externalThumbnailUrl: nextThumbnailUrl,
         sourceUrl: nextSourceUrl,
       });
       video.machineTube.externalPlaybackUrl = nextPlaybackUrl;
+      video.machineTube.externalPlaybackHlsUrl = nextPlaybackHlsUrl;
+      video.machineTube.externalThumbnailUrl = nextThumbnailUrl;
       video.machineTube.sourceUrl = nextSourceUrl;
       video.machineTube.lastSyncedAt = new Date().toISOString();
       video.machineTube.lastSyncError = null;
@@ -1085,6 +1606,16 @@ function normalizeRegisteredVideo(value: unknown): RegisteredVideo | null {
   }
 
   const machineTube = record.machineTube as JsonRecord | undefined;
+  const outputs = record.outputs as JsonRecord | undefined;
+  const thumbnail = outputs?.thumbnail as JsonRecord | undefined;
+  const hls = outputs?.hls as JsonRecord | undefined;
+  const hlsPlaylist = hls?.playlist as JsonRecord | undefined;
+  const hlsFiles = Array.isArray(hls?.files)
+    ? hls.files
+        .map((file) => normalizeGeneratedHlsFile(file))
+        .filter((file): file is GeneratedHlsFile => file !== null)
+    : [];
+
   return {
     id: normalizeOptionalString(record.id) ?? createId("vid"),
     filePath,
@@ -1092,6 +1623,21 @@ function normalizeRegisteredVideo(value: unknown): RegisteredVideo | null {
     mimeType,
     bytes,
     createdAt,
+    outputs: {
+      probe: normalizeVideoProbe(outputs?.probe),
+      thumbnail: normalizeGeneratedAsset(thumbnail),
+      hls:
+        hlsPlaylist && hlsFiles.length > 0
+          ? {
+              rootDirectory: normalizeOptionalString(hls?.rootDirectory) ?? dirname(normalizeOptionalString(hlsPlaylist.localPath) ?? ""),
+              playlist: normalizeGeneratedHlsFile(hlsPlaylist) ?? hlsFiles[0],
+              files: hlsFiles,
+              generatedAt: normalizeOptionalString(hls?.generatedAt) ?? normalizeOptionalString(outputs?.lastPreparedAt) ?? createdAt,
+            }
+          : null,
+      lastPreparedAt: normalizeOptionalString(outputs?.lastPreparedAt),
+      lastPreparationError: normalizeOptionalString(outputs?.lastPreparationError),
+    },
     machineTube: {
       lastPublishedAt: normalizeOptionalString(machineTube?.lastPublishedAt),
       lastSyncedAt: normalizeOptionalString(machineTube?.lastSyncedAt),
@@ -1101,9 +1647,75 @@ function normalizeRegisteredVideo(value: unknown): RegisteredVideo | null {
       status: normalizeOptionalString(machineTube?.status),
       title: normalizeOptionalString(machineTube?.title),
       externalPlaybackUrl: normalizeOptionalString(machineTube?.externalPlaybackUrl),
+      externalPlaybackHlsUrl: normalizeOptionalString(machineTube?.externalPlaybackHlsUrl),
       externalThumbnailUrl: normalizeOptionalString(machineTube?.externalThumbnailUrl),
       sourceUrl: normalizeOptionalString(machineTube?.sourceUrl),
     },
+  };
+}
+
+function normalizeVideoProbe(value: unknown): VideoProbe | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+
+  const record = value as JsonRecord;
+  const durationSeconds = Number(record.durationSeconds);
+  const width = record.width === null || record.width === undefined ? null : Number(record.width);
+  const height = record.height === null || record.height === undefined ? null : Number(record.height);
+
+  if (!Number.isFinite(durationSeconds) || durationSeconds < 0) {
+    return null;
+  }
+
+  return {
+    durationSeconds,
+    width: Number.isFinite(width) ? width : null,
+    height: Number.isFinite(height) ? height : null,
+  };
+}
+
+function normalizeGeneratedAsset(value: unknown): GeneratedAsset | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+
+  const record = value as JsonRecord;
+  const localPath = normalizeOptionalString(record.localPath);
+  const mimeType = normalizeOptionalString(record.mimeType);
+  const generatedAt = normalizeOptionalString(record.generatedAt);
+  const bytes = Number(record.bytes);
+  if (!localPath || !mimeType || !generatedAt || !Number.isFinite(bytes) || bytes < 0) {
+    return null;
+  }
+
+  return {
+    localPath,
+    mimeType,
+    generatedAt,
+    bytes,
+  };
+}
+
+function normalizeGeneratedHlsFile(value: unknown): GeneratedHlsFile | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+
+  const record = value as JsonRecord;
+  const localPath = normalizeOptionalString(record.localPath);
+  const relativePath = normalizeOptionalString(record.relativePath);
+  const mimeType = normalizeOptionalString(record.mimeType) ?? (localPath ? guessMimeType(localPath) : null);
+  const bytes = Number(record.bytes);
+  if (!localPath || !relativePath || !mimeType || !Number.isFinite(bytes) || bytes < 0) {
+    return null;
+  }
+
+  return {
+    localPath,
+    relativePath,
+    mimeType,
+    bytes,
   };
 }
 
@@ -1144,6 +1756,8 @@ function buildHeartbeatPayload(req: IncomingMessage): JsonRecord {
           machineTubeVideoId: video.machineTube.videoId,
           machineTubeWatchUrl: video.machineTube.watchUrl,
           playbackUrl: response.playbackUrl,
+          hlsPlaybackUrl: response.hlsPlaybackUrl,
+          thumbnailUrl: response.thumbnailUrl,
           title: video.machineTube.title ?? video.fileName,
           lastPublishedAt: video.machineTube.lastPublishedAt,
           machineTubeStatus: video.machineTube.status,
@@ -1170,9 +1784,12 @@ function buildOriginHealthPayload(req: IncomingMessage): JsonRecord {
         localVideoId: video.id,
         machineTubeVideoId: video.machineTube.videoId,
         playbackUrl: response.playbackUrl,
+        hlsPlaybackUrl: response.hlsPlaybackUrl,
+        thumbnailUrl: response.thumbnailUrl,
         filePresent,
         originStatus: reachable ? "reachable" : "degraded",
         lastPublishedAt: video.machineTube.lastPublishedAt,
+        lastPreparationError: video.outputs.lastPreparationError,
       };
     }),
   };
@@ -1227,6 +1844,24 @@ function serveVideo(req: IncomingMessage, res: ServerResponse<IncomingMessage>, 
   createReadStream(video.filePath, { start, end }).pipe(res);
 }
 
+function serveStaticAsset(
+  req: IncomingMessage,
+  res: ServerResponse<IncomingMessage>,
+  asset: GeneratedAsset | GeneratedHlsFile,
+): void {
+  const fileStat = statSync(asset.localPath);
+  res.writeHead(200, {
+    "Content-Type": asset.mimeType,
+    "Content-Length": fileStat.size,
+    "Cache-Control": asset.mimeType === "application/vnd.apple.mpegurl" ? "no-store" : "public, max-age=60",
+  });
+  if (req.method === "HEAD") {
+    res.end();
+    return;
+  }
+  createReadStream(asset.localPath).pipe(res);
+}
+
 function parseRange(header: string, totalBytes: number): { start: number; end: number } | null {
   const match = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
   if (!match) {
@@ -1265,10 +1900,17 @@ function parseRange(header: string, totalBytes: number): { start: number; end: n
 
 function guessMimeType(filePath: string): string {
   switch (extname(filePath).toLowerCase()) {
+    case ".jpg":
+    case ".jpeg":
+      return "image/jpeg";
+    case ".m3u8":
+      return "application/vnd.apple.mpegurl";
     case ".mp4":
       return "video/mp4";
     case ".m4v":
       return "video/x-m4v";
+    case ".ts":
+      return "video/mp2t";
     case ".webm":
       return "video/webm";
     case ".mkv":
@@ -1429,6 +2071,134 @@ function safeReadText(path: string): string {
   } catch {
     return "";
   }
+}
+
+function canRunExecutable(command: string, args: string[]): boolean {
+  try {
+    const result = spawnSync(command, args, {
+      stdio: "ignore",
+      shell: false,
+    });
+    return !result.error && result.status === 0;
+  } catch {
+    return false;
+  }
+}
+
+function resolveExecutableOnPath(platformFileName: string, fallbackCommand: string): string | null {
+  const locator = process.platform === "win32" ? "where" : "which";
+  const query = process.platform === "win32" ? platformFileName : fallbackCommand;
+
+  try {
+    const result = spawnSync(locator, [query], {
+      stdio: "pipe",
+      encoding: "utf8",
+      shell: false,
+    });
+    if (result.error || result.status !== 0) {
+      return null;
+    }
+
+    const firstLine = result.stdout
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find(Boolean);
+
+    return firstLine ? resolve(firstLine) : null;
+  } catch {
+    return null;
+  }
+}
+
+function extractArchive(path: string, destination: string, archiveType: "zip" | "tar.xz"): void {
+  const tarResult = spawnSync("tar", ["-xf", path, "-C", destination], {
+    stdio: "ignore",
+    shell: false,
+  });
+  if (!tarResult.error && tarResult.status === 0) {
+    return;
+  }
+
+  if (process.platform === "win32" && archiveType === "zip") {
+    const psResult = spawnSync(
+      "powershell",
+      ["-NoProfile", "-Command", `Expand-Archive -LiteralPath '${path.replace(/'/g, "''")}' -DestinationPath '${destination.replace(/'/g, "''")}' -Force`],
+      {
+        stdio: "ignore",
+        shell: false,
+      },
+    );
+    if (!psResult.error && psResult.status === 0) {
+      return;
+    }
+  }
+
+  throw new Error(`Failed to extract archive ${path}. Ensure tar is available on this system.`);
+}
+
+function findFileRecursive(root: string, fileName: string): string | null {
+  const entries = readdirSync(root, { withFileTypes: true });
+  for (const entry of entries) {
+    const fullPath = resolve(root, entry.name);
+    if (entry.isDirectory()) {
+      const nested = findFileRecursive(fullPath, fileName);
+      if (nested) {
+        return nested;
+      }
+      continue;
+    }
+    if (entry.isFile() && entry.name === fileName) {
+      return fullPath;
+    }
+  }
+  return null;
+}
+
+function managedMediaToolFileName(tool: "ffmpeg" | "ffprobe", platform: NodeJS.Platform): string {
+  return platform === "win32" ? `${tool}.exe` : tool;
+}
+
+function resolveMediaToolsDownloadAsset(
+  platform: NodeJS.Platform,
+  arch: string,
+): { url: string; archiveFileName: string; archiveType: "zip" | "tar.xz" } {
+  const base = "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download";
+
+  if (platform === "win32") {
+    if (arch === "x64") {
+      return {
+        url: `${base}/ffmpeg-master-latest-win64-gpl.zip`,
+        archiveFileName: "ffmpeg-master-latest-win64-gpl.zip",
+        archiveType: "zip",
+      };
+    }
+    if (arch === "arm64") {
+      return {
+        url: `${base}/ffmpeg-master-latest-winarm64-gpl.zip`,
+        archiveFileName: "ffmpeg-master-latest-winarm64-gpl.zip",
+        archiveType: "zip",
+      };
+    }
+  }
+
+  if (platform === "linux") {
+    if (arch === "x64") {
+      return {
+        url: `${base}/ffmpeg-master-latest-linux64-gpl.tar.xz`,
+        archiveFileName: "ffmpeg-master-latest-linux64-gpl.tar.xz",
+        archiveType: "tar.xz",
+      };
+    }
+    if (arch === "arm64") {
+      return {
+        url: `${base}/ffmpeg-master-latest-linuxarm64-gpl.tar.xz`,
+        archiveFileName: "ffmpeg-master-latest-linuxarm64-gpl.tar.xz",
+        archiveType: "tar.xz",
+      };
+    }
+  }
+
+  throw new Error(`Managed FFmpeg bootstrap is not implemented for ${platform}/${arch}.`);
 }
 
 function managedCloudflaredFileName(platform: NodeJS.Platform): string {

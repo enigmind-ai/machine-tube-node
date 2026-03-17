@@ -72,6 +72,9 @@ fi
 echo "Building mt-node"
 npm run build
 
+echo "Preparing managed media tools"
+node "$INSTALL_DIR/scripts/bootstrap-media-tools.mjs"
+
 cat > "$WRAPPER_PATH" <<EOF
 #!/usr/bin/env sh
 set -eu
@@ -95,6 +98,9 @@ Mode: docker
 mt-node was launched as its own Docker container.
 Drop videos into the inbox folder and point OpenClaw at:
   http://host.docker.internal:43110
+
+For built-in thumbnail and HLS output, mt-node can manage FFmpeg itself. See:
+  $INSTALL_DIR/README.md
 EOF
 else
   cat <<EOF
@@ -107,6 +113,9 @@ Mode: local
 
 For local/host installs, the inbox folder is ready to use directly.
 Drop videos into the inbox folder, then start mt-node and publish the latest or a named inbox file.
+
+For built-in thumbnail and HLS output, mt-node can manage FFmpeg itself. See:
+  $INSTALL_DIR/README.md
 
 Make sure $BIN_DIR is on PATH, then run:
   mt-node
