@@ -103,6 +103,20 @@ type MachineTubePublishResult = {
   watchUrl: string;
 };
 
+type RuntimeEnvironment = {
+  platform: NodeJS.Platform;
+  dockerLikely: boolean;
+};
+
+type InboxAvailability = {
+  directory: string;
+  mode: "host-local" | "host-bind" | "container-local" | "docker-volume";
+  usableForHumanDrop: boolean;
+  message: string;
+  mountPoint: string | null;
+  mountSource: string | null;
+};
+
 class TunnelManager {
   private readonly mode: TunnelMode;
   private readonly publicBaseUrlFromEnv: string;
@@ -329,6 +343,7 @@ const paths: RuntimePaths = {
 const port = parseNumber(process.env.MT_NODE_PORT, 43110);
 const host = process.env.MT_NODE_HOST?.trim() || "0.0.0.0";
 const startedAt = new Date();
+const runtimeEnvironment = detectRuntimeEnvironment();
 
 mkdirSync(paths.dataDir, { recursive: true });
 mkdirSync(paths.binDir, { recursive: true });
@@ -367,7 +382,12 @@ const server = http.createServer(async (req, res) => {
         config,
         videoCount: videos.length,
         publishedVideoCount: countPublishedMachineTubeVideos(),
+        runtime: runtimeEnvironment,
         tunnel: tunnelManager.getSnapshot(),
+        inbox: {
+          availability: evaluateInboxAvailability(paths.inboxDir, runtimeEnvironment),
+          files: listInboxFiles(),
+        },
         heartbeat: buildHeartbeatPayload(req),
       });
     }
@@ -416,7 +436,7 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, {
         ok: true,
         inbox: {
-          directory: paths.inboxDir,
+          availability: evaluateInboxAvailability(paths.inboxDir, runtimeEnvironment),
           files: listInboxFiles(),
         },
       });
@@ -645,6 +665,12 @@ function resolvePublishSourceSelection(body: PublishRequestBody):
     };
   }
 
+  const inboxAvailability = evaluateInboxAvailability(paths.inboxDir, runtimeEnvironment);
+  const inboxGuard = ensureInboxAvailableForHumanDrop(inboxAvailability);
+  if (!inboxGuard.ok) {
+    return inboxGuard;
+  }
+
   const inboxFileName = normalizeOptionalString(body.inboxFileName);
   if (inboxFileName) {
     const resolved = resolveInboxFilePath(inboxFileName);
@@ -656,7 +682,7 @@ function resolvePublishSourceSelection(body: PublishRequestBody):
       filePath: resolved.filePath,
       selection: {
         mode: "inboxFileName",
-        inboxDir: paths.inboxDir,
+        inbox: inboxAvailability,
         inboxFileName,
         filePath: resolved.filePath,
       },
@@ -673,7 +699,7 @@ function resolvePublishSourceSelection(body: PublishRequestBody):
       filePath: latest.filePath,
       selection: {
         mode: "latestInboxVideo",
-        inboxDir: paths.inboxDir,
+        inbox: inboxAvailability,
         inboxFileName: latest.fileName,
         filePath: latest.filePath,
       },
@@ -684,7 +710,7 @@ function resolvePublishSourceSelection(body: PublishRequestBody):
     ok: false,
     status: 400,
     error: "Provide filePath, inboxFileName, or useLatestInboxVideo=true.",
-    details: { inboxDir: paths.inboxDir },
+    details: { inbox: inboxAvailability },
   };
 }
 
@@ -704,6 +730,21 @@ function listInboxFiles(): JsonRecord[] {
     })
     .filter((entry) => String(entry.mimeType) !== "application/octet-stream")
     .sort((left, right) => String(right.modifiedAt).localeCompare(String(left.modifiedAt)));
+}
+
+function ensureInboxAvailableForHumanDrop(availability: InboxAvailability):
+  | { ok: true }
+  | { ok: false; status: number; error: string; details?: JsonRecord } {
+  if (availability.usableForHumanDrop) {
+    return { ok: true };
+  }
+
+  return {
+    ok: false,
+    status: 409,
+    error: availability.message,
+    details: { inbox: availability },
+  };
 }
 
 function resolveInboxFilePath(fileName: string):
@@ -1086,7 +1127,7 @@ function buildHeartbeatPayload(req: IncomingMessage): JsonRecord {
     publicBaseUrl: tunnel.publicBaseUrl,
     tunnel,
     inbox: {
-      directory: paths.inboxDir,
+      availability: evaluateInboxAvailability(paths.inboxDir, runtimeEnvironment),
       availableFiles: listInboxFiles(),
     },
     machineTube: {
@@ -1268,6 +1309,126 @@ function defaultInboxDir(): string {
     return resolve(process.cwd(), "MachineTube", "videos");
   }
   return resolve(homeDir, "MachineTube", "videos");
+}
+
+function detectRuntimeEnvironment(): RuntimeEnvironment {
+  const cgroup = process.platform === "linux" ? safeReadText("/proc/1/cgroup") : "";
+  return {
+    platform: process.platform,
+    dockerLikely:
+      process.platform === "linux" &&
+      (existsSync("/.dockerenv") || cgroup.includes("docker") || cgroup.includes("containerd") || cgroup.includes("kubepods")),
+  };
+}
+
+function evaluateInboxAvailability(directory: string, environment: RuntimeEnvironment): InboxAvailability {
+  if (!environment.dockerLikely) {
+    return {
+      directory,
+      mode: "host-local",
+      usableForHumanDrop: true,
+      message: "Inbox folder is local to this machine and ready for direct file drop.",
+      mountPoint: null,
+      mountSource: null,
+    };
+  }
+
+  const mount = findBestMountInfo(directory);
+  if (!mount || mount.fsType === "overlay") {
+    return {
+      directory,
+      mode: "container-local",
+      usableForHumanDrop: false,
+      message: `mt-node is running in Docker and ${directory} is not backed by a host bind mount. Mount a host folder here so humans can drop videos locally without entering the container.`,
+      mountPoint: mount?.mountPoint ?? null,
+      mountSource: mount?.mountSource ?? null,
+    };
+  }
+
+  if (mount.mountSource.startsWith("/var/lib/docker/volumes/")) {
+    return {
+      directory,
+      mode: "docker-volume",
+      usableForHumanDrop: false,
+      message: `mt-node inbox ${directory} is backed by a Docker volume, not a host bind mount. Use a host folder mount so humans can drop videos locally from the machine.`,
+      mountPoint: mount.mountPoint,
+      mountSource: mount.mountSource,
+    };
+  }
+
+  return {
+    directory,
+    mode: "host-bind",
+    usableForHumanDrop: true,
+    message: "Inbox folder is Docker-mounted from the host and ready for local file drop.",
+    mountPoint: mount.mountPoint,
+    mountSource: mount.mountSource,
+  };
+}
+
+function findBestMountInfo(targetDirectory: string): { mountPoint: string; mountSource: string; fsType: string } | null {
+  if (process.platform !== "linux") {
+    return null;
+  }
+
+  const raw = safeReadText("/proc/self/mountinfo");
+  if (!raw) {
+    return null;
+  }
+
+  const normalizedTarget = normalizeMountPath(targetDirectory);
+  let bestMatch: { mountPoint: string; mountSource: string; fsType: string } | null = null;
+
+  for (const line of raw.split(/\r?\n/)) {
+    if (!line.trim()) {
+      continue;
+    }
+
+    const parts = line.split(" - ");
+    if (parts.length !== 2) {
+      continue;
+    }
+
+    const left = parts[0].split(" ");
+    const right = parts[1].split(" ");
+    const mountPoint = normalizeMountPath(decodeMountInfoValue(left[4] ?? ""));
+    const mountSource = decodeMountInfoValue(right[1] ?? "");
+    const fsType = right[0] ?? "";
+
+    if (!pathContains(normalizedTarget, mountPoint)) {
+      continue;
+    }
+
+    if (!bestMatch || mountPoint.length > bestMatch.mountPoint.length) {
+      bestMatch = { mountPoint, mountSource, fsType };
+    }
+  }
+
+  return bestMatch;
+}
+
+function normalizeMountPath(value: string): string {
+  return resolve(value).replace(/\\/g, "/");
+}
+
+function pathContains(target: string, candidatePrefix: string): boolean {
+  return target === candidatePrefix || target.startsWith(`${candidatePrefix}/`);
+}
+
+function decodeMountInfoValue(value: string): string {
+  return value
+    .replace(/\\040/g, " ")
+    .replace(/\\011/g, "\t")
+    .replace(/\\012/g, "\n")
+    .replace(/\\134/g, "\\");
+}
+
+function safeReadText(path: string): string {
+  try {
+    return readFileSync(path, "utf8");
+  } catch {
+    return "";
+  }
 }
 
 function managedCloudflaredFileName(platform: NodeJS.Platform): string {

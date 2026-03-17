@@ -83,6 +83,10 @@ Install directory: $INSTALL_DIR
 Launcher: $WRAPPER_PATH
 MachineTube inbox: $INBOX_DIR
 
+For local/host installs, the inbox folder is ready to use directly.
+For Docker OpenClaw installs, run this helper on the host to print the required bind mount:
+  node "$INSTALL_DIR/scripts/setup-openclaw-inbox.mjs"
+
 Drop videos into the inbox folder, then start mt-node and publish the latest or a named inbox file.
 
 Make sure $BIN_DIR is on PATH, then run:
