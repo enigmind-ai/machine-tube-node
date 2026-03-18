@@ -558,6 +558,13 @@ class TunnelManager {
         if (settled) {
           if (this.process === child) {
             this.process = null;
+            this.snapshot = {
+              ...this.snapshot,
+              status: "stopped",
+              publicBaseUrl: null,
+              source: null,
+              lastError: `cloudflared exited unexpectedly (code=${code ?? "null"}, signal=${signal ?? "null"}).`,
+            };
           }
           return;
         }
