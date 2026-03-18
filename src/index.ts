@@ -727,18 +727,30 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "POST" && url.pathname === "/publish") {
       const body = (await readJsonBody(req)) as PublishRequestBody;
+      const hasMachineTubeCreds = Boolean(
+        body.machineTube && typeof body.machineTube === "object" &&
+        (body.machineTube as Record<string, unknown>).agentId
+      );
+      console.log(
+        `[mt-node] publish: request received — publishToMachineTube=${String(body.publishToMachineTube ?? "unset")}, hasMachineTubeCreds=${String(hasMachineTubeCreds)}, title="${typeof body.title === "string" ? body.title : ""}"`,
+      );
+
       const selection = resolvePublishSourceSelection(body);
       if (!selection.ok) {
+        console.warn(`[mt-node] publish: rejected — ${selection.error}`);
         return sendJson(res, selection.status, { ok: false, error: selection.error, ...(selection.details ?? {}) });
       }
 
       const registerResult = await ensureRegisteredVideo(selection.filePath);
       if (!registerResult.ok) {
+        console.warn(`[mt-node] publish: file error — ${registerResult.error}`);
         return sendJson(res, registerResult.status, { ok: false, error: registerResult.error, ...(registerResult.details ?? {}) });
       }
+      console.log(`[mt-node] publish: file resolved — ${selection.filePath}`);
 
       const tunnel = await tunnelManager.ensureStarted();
       if (!tunnel.publicBaseUrl) {
+        console.error("[mt-node] publish: no tunnel URL available");
         return sendJson(res, 502, { ok: false, error: "No public playback URL is available. Check the tunnel configuration." });
       }
 
@@ -759,6 +771,8 @@ const server = http.createServer(async (req, res) => {
       );
 
       if (!publishToMachineTube) {
+        console.log(`[mt-node] publish: MachineTube step skipped (no credentials in request body or config, and publishToMachineTube not forced)`);
+        console.log(`[mt-node] publish: playback URL ready → ${externalPlaybackUrl}`);
         return sendJson(res, registerResult.created ? 201 : 200, {
           ok: true,
           selection: selection.selection,
@@ -816,6 +830,10 @@ const server = http.createServer(async (req, res) => {
         sourceUrl: normalizeOptionalString(body.sourceUrl) ?? `${tunnel.publicBaseUrl}/heartbeat`,
       };
       persistVideos();
+
+      console.log(`[mt-node] publish: published to MachineTube — videoId=${publishResult.videoId}, watchUrl=${publishResult.watchUrl}`);
+      console.log(`[mt-node] publish: playback URL → ${externalPlaybackUrl}`);
+      console.log(`[mt-node] publish: sourceUrl    → ${video.machineTube.sourceUrl}`);
 
       return sendJson(res, registerResult.created ? 201 : 200, {
         ok: true,
