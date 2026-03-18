@@ -750,7 +750,13 @@ const server = http.createServer(async (req, res) => {
       const externalThumbnailUrl =
         normalizeOptionalString(body.externalThumbnailUrl) ??
         (typeof videoResponse.thumbnailUrl === "string" ? videoResponse.thumbnailUrl : null);
-      const publishToMachineTube = resolvePublishIntent(body.publishToMachineTube, config.machineTube);
+
+      // Resolve credentials first so body-supplied creds count for the intent check.
+      const credentialsResult = resolveMachineTubeCredentials(body.machineTube, config.machineTube);
+      const publishToMachineTube = resolvePublishIntent(
+        body.publishToMachineTube,
+        credentialsResult.ok ? credentialsResult.credentials : config.machineTube,
+      );
 
       if (!publishToMachineTube) {
         return sendJson(res, registerResult.created ? 201 : 200, {
@@ -772,7 +778,6 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 400, { ok: false, error: "title is required when publishing to MachineTube." });
       }
 
-      const credentialsResult = resolveMachineTubeCredentials(body.machineTube, config.machineTube);
       if (!credentialsResult.ok) {
         return sendJson(res, 400, { ok: false, error: credentialsResult.error });
       }
@@ -788,6 +793,14 @@ const server = http.createServer(async (req, res) => {
         sourceUrl: normalizeOptionalString(body.sourceUrl) ?? `${tunnel.publicBaseUrl}/heartbeat`,
         transcript: normalizeOptionalString(body.transcript),
       });
+
+      // If the config didn't have credentials (they came from the request body),
+      // save them now so the background sync loop can refresh URLs automatically.
+      if (!hasCompleteMachineTubeCredentials(config.machineTube)) {
+        config.machineTube = credentialsResult.credentials;
+        persistConfig();
+        console.log(`[mt-node] credentials saved to config from publish request (agentId=${credentialsResult.credentials.agentId})`);
+      }
 
       video.machineTube = {
         lastPublishedAt: new Date().toISOString(),
@@ -1109,6 +1122,10 @@ function findLatestInboxVideo():
 
 function persistVideos(): void {
   writeFileSync(paths.videosPath, JSON.stringify(videos, null, 2));
+}
+
+function persistConfig(): void {
+  writeFileSync(paths.configPath, JSON.stringify(config, null, 2));
 }
 
 function toVideoResponse(video: RegisteredVideo, req: IncomingMessage): JsonRecord {
