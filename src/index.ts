@@ -55,6 +55,7 @@ type RegisteredVideo = {
     watchUrl: string | null;
     status: string | null;
     title: string | null;
+    durationSeconds: number | null;
     externalPlaybackUrl: string | null;
     externalPlaybackHlsUrl: string | null;
     externalThumbnailUrl: string | null;
@@ -762,6 +763,7 @@ const server = http.createServer(async (req, res) => {
       const externalThumbnailUrl =
         normalizeOptionalString(body.externalThumbnailUrl) ??
         (typeof videoResponse.thumbnailUrl === "string" ? videoResponse.thumbnailUrl : null);
+      const durationSeconds = video.outputs.probe?.durationSeconds ?? null;
 
       // Explicit opt-out is the only way to skip the MachineTube publish step.
       if (body.publishToMachineTube === false) {
@@ -798,6 +800,7 @@ const server = http.createServer(async (req, res) => {
         externalPlaybackUrl,
         externalPlaybackHlsUrl,
         externalThumbnailUrl,
+        durationSeconds,
         title,
         description: typeof body.description === "string" ? body.description.trim() : "",
         tags: normalizeTags(body.tags),
@@ -821,6 +824,7 @@ const server = http.createServer(async (req, res) => {
         watchUrl: publishResult.watchUrl,
         status: publishResult.status,
         title,
+        durationSeconds,
         externalPlaybackUrl,
         externalPlaybackHlsUrl,
         externalThumbnailUrl,
@@ -980,6 +984,7 @@ async function ensureRegisteredVideo(filePath: string):
       watchUrl: null,
       status: null,
       title: null,
+      durationSeconds: null,
       externalPlaybackUrl: null,
       externalPlaybackHlsUrl: null,
       externalThumbnailUrl: null,
@@ -1379,6 +1384,7 @@ async function publishExternalVideoToMachineTube(input: {
   externalPlaybackUrl: string;
   externalPlaybackHlsUrl: string | null;
   externalThumbnailUrl: string | null;
+  durationSeconds: number | null;
   title: string;
   description: string;
   tags: string[];
@@ -1398,6 +1404,7 @@ async function publishExternalVideoToMachineTube(input: {
       externalPlaybackUrl: input.externalPlaybackUrl,
       externalPlaybackHlsUrl: input.externalPlaybackHlsUrl,
       externalThumbnailUrl: input.externalThumbnailUrl,
+      durationSeconds: input.durationSeconds,
       title: input.title,
       description: input.description,
       tags: input.tags,
@@ -1437,6 +1444,7 @@ async function refreshExternalVideoOriginInMachineTube(input: {
   externalPlaybackUrl: string;
   externalPlaybackHlsUrl: string | null;
   externalThumbnailUrl: string | null;
+  durationSeconds: number | null;
   sourceUrl: string | null;
 }): Promise<void> {
   const baseUrl = normalizeBaseUrl(input.credentials.baseUrl);
@@ -1451,6 +1459,7 @@ async function refreshExternalVideoOriginInMachineTube(input: {
       externalPlaybackUrl: input.externalPlaybackUrl,
       externalPlaybackHlsUrl: input.externalPlaybackHlsUrl,
       externalThumbnailUrl: input.externalThumbnailUrl,
+      durationSeconds: input.durationSeconds,
       sourceUrl: input.sourceUrl,
     }),
   });
@@ -1494,6 +1503,7 @@ async function syncPublishedVideoOrigins(): Promise<void> {
     const nextPlaybackUrl = `${tunnel.publicBaseUrl}/media/${encodeURIComponent(video.id)}`;
     const nextPlaybackHlsUrl = video.outputs.hls ? `${tunnel.publicBaseUrl}/media/${encodeURIComponent(video.id)}/hls/index.m3u8` : null;
     const nextSourceUrl = `${tunnel.publicBaseUrl}/heartbeat`;
+    const nextDurationSeconds = video.outputs.probe?.durationSeconds ?? null;
     const nextThumbnailUrl = video.outputs.thumbnail
       ? `${tunnel.publicBaseUrl}/media/${encodeURIComponent(video.id)}/thumbnail.jpg`
       : video.machineTube.externalThumbnailUrl;
@@ -1502,6 +1512,7 @@ async function syncPublishedVideoOrigins(): Promise<void> {
       video.machineTube.externalPlaybackUrl === nextPlaybackUrl &&
       video.machineTube.externalPlaybackHlsUrl === nextPlaybackHlsUrl &&
       video.machineTube.externalThumbnailUrl === nextThumbnailUrl &&
+      video.machineTube.durationSeconds === nextDurationSeconds &&
       video.machineTube.sourceUrl === nextSourceUrl
     ) {
       if (video.machineTube.lastSyncError) {
@@ -1524,11 +1535,13 @@ async function syncPublishedVideoOrigins(): Promise<void> {
         externalPlaybackUrl: nextPlaybackUrl,
         externalPlaybackHlsUrl: nextPlaybackHlsUrl,
         externalThumbnailUrl: nextThumbnailUrl,
+        durationSeconds: nextDurationSeconds,
         sourceUrl: nextSourceUrl,
       });
       video.machineTube.externalPlaybackUrl = nextPlaybackUrl;
       video.machineTube.externalPlaybackHlsUrl = nextPlaybackHlsUrl;
       video.machineTube.externalThumbnailUrl = nextThumbnailUrl;
+      video.machineTube.durationSeconds = nextDurationSeconds;
       video.machineTube.sourceUrl = nextSourceUrl;
       video.machineTube.lastSyncedAt = new Date().toISOString();
       video.machineTube.lastSyncError = null;
@@ -1704,6 +1717,10 @@ function normalizeRegisteredVideo(value: unknown): RegisteredVideo | null {
       watchUrl: normalizeOptionalString(machineTube?.watchUrl),
       status: normalizeOptionalString(machineTube?.status),
       title: normalizeOptionalString(machineTube?.title),
+      durationSeconds:
+        typeof machineTube?.durationSeconds === "number" && Number.isFinite(machineTube.durationSeconds)
+          ? Math.round(machineTube.durationSeconds)
+          : null,
       externalPlaybackUrl: normalizeOptionalString(machineTube?.externalPlaybackUrl),
       externalPlaybackHlsUrl: normalizeOptionalString(machineTube?.externalPlaybackHlsUrl),
       externalThumbnailUrl: normalizeOptionalString(machineTube?.externalThumbnailUrl),
