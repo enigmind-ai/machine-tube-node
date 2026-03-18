@@ -763,15 +763,9 @@ const server = http.createServer(async (req, res) => {
         normalizeOptionalString(body.externalThumbnailUrl) ??
         (typeof videoResponse.thumbnailUrl === "string" ? videoResponse.thumbnailUrl : null);
 
-      // Resolve credentials first so body-supplied creds count for the intent check.
-      const credentialsResult = resolveMachineTubeCredentials(body.machineTube, config.machineTube);
-      const publishToMachineTube = resolvePublishIntent(
-        body.publishToMachineTube,
-        credentialsResult.ok ? credentialsResult.credentials : config.machineTube,
-      );
-
-      if (!publishToMachineTube) {
-        console.log(`[mt-node] publish: MachineTube step skipped (no credentials in request body or config, and publishToMachineTube not forced)`);
+      // Explicit opt-out is the only way to skip the MachineTube publish step.
+      if (body.publishToMachineTube === false) {
+        console.log(`[mt-node] publish: MachineTube step skipped (publishToMachineTube=false)`);
         console.log(`[mt-node] publish: playback URL ready → ${externalPlaybackUrl}`);
         return sendJson(res, registerResult.created ? 201 : 200, {
           ok: true,
@@ -780,10 +774,7 @@ const server = http.createServer(async (req, res) => {
           externalPlaybackUrl,
           externalPlaybackHlsUrl,
           externalThumbnailUrl,
-          machineTube: {
-            published: false,
-            reason: "MachineTube publish skipped. Credentials are not configured or publishToMachineTube was disabled.",
-          },
+          machineTube: { published: false, reason: "publishToMachineTube was set to false." },
         });
       }
 
@@ -792,8 +783,14 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 400, { ok: false, error: "title is required when publishing to MachineTube." });
       }
 
+      // Credentials are required — body takes priority, config is the fallback.
+      const credentialsResult = resolveMachineTubeCredentials(body.machineTube, config.machineTube);
       if (!credentialsResult.ok) {
-        return sendJson(res, 400, { ok: false, error: credentialsResult.error });
+        console.warn(`[mt-node] publish: rejected — MachineTube credentials missing. Pass machineTube: { baseUrl, agentId, apiKey } in the request body, or set publishToMachineTube=false to skip.`);
+        return sendJson(res, 400, {
+          ok: false,
+          error: "MachineTube credentials are required. Include machineTube: { baseUrl, agentId, apiKey } in the request body, or set publishToMachineTube: false to skip the MachineTube publish step.",
+        });
       }
 
       const publishResult = await publishExternalVideoToMachineTube({
