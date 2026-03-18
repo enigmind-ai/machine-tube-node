@@ -460,12 +460,14 @@ class TunnelManager {
   private async bootstrapBinaryInternal(): Promise<CloudflaredBootstrapResult> {
     const explicitBinary = this.cloudflaredBin !== "cloudflared" ? resolve(this.cloudflaredBin) : "";
     if (explicitBinary && existsSync(explicitBinary)) {
+      console.log(`[mt-node] cloudflared: using explicit binary at ${explicitBinary}`);
       this.snapshot = { ...this.snapshot, executablePath: explicitBinary, lastError: null };
       return { executablePath: explicitBinary, managed: false, downloadUrl: null };
     }
 
     if (existsSync(this.managedCloudflaredPath)) {
       ensureExecutable(this.managedCloudflaredPath);
+      console.log(`[mt-node] cloudflared: using managed binary at ${this.managedCloudflaredPath}`);
       this.snapshot = { ...this.snapshot, executablePath: this.managedCloudflaredPath, lastError: null };
       return { executablePath: this.managedCloudflaredPath, managed: true, downloadUrl: null };
     }
@@ -473,6 +475,7 @@ class TunnelManager {
     const asset = resolveCloudflaredDownloadAsset(process.platform, process.arch);
     mkdirSync(dirname(this.managedCloudflaredPath), { recursive: true });
 
+    console.log(`[mt-node] cloudflared: downloading binary from ${asset.url}`);
     const response = await fetch(asset.url);
     if (!response.ok) {
       throw new Error(`Failed to download cloudflared from ${asset.url}: ${response.status} ${response.statusText}`);
@@ -481,6 +484,7 @@ class TunnelManager {
     const bytes = Buffer.from(await response.arrayBuffer());
     writeFileSync(this.managedCloudflaredPath, bytes);
     ensureExecutable(this.managedCloudflaredPath);
+    console.log(`[mt-node] cloudflared: binary downloaded to ${this.managedCloudflaredPath}`);
     this.snapshot = { ...this.snapshot, executablePath: this.managedCloudflaredPath, lastError: null };
     return { executablePath: this.managedCloudflaredPath, managed: true, downloadUrl: asset.url };
   }
@@ -491,7 +495,9 @@ class TunnelManager {
       this.mode === "binary"
         ? ["tunnel", "--no-autoupdate", "--url", this.targetUrl]
         : ["run", "--rm", "cloudflare/cloudflared:latest", "tunnel", "--no-autoupdate", "--url", this.targetUrl];
- 
+
+    console.log(`[mt-node] cloudflared: starting tunnel → ${this.targetUrl} (mode=${this.mode}, timeout=${this.timeoutMs}ms)`);
+
     return new Promise<TunnelSnapshot>((resolvePromise, rejectPromise) => {
       const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
       this.process = child;
@@ -511,6 +517,7 @@ class TunnelManager {
           executablePath: this.mode === "binary" ? command : null,
           lastError: null,
         };
+        console.log(`[mt-node] cloudflared: tunnel online at ${publicBaseUrl}`);
         resolvePromise(this.getSnapshot());
       };
 
@@ -529,6 +536,7 @@ class TunnelManager {
         if (this.process === child) {
           this.process = null;
         }
+        console.error(`[mt-node] cloudflared: failed to start — ${message}`);
         rejectPromise(new Error(message));
       };
 
@@ -558,13 +566,15 @@ class TunnelManager {
         if (settled) {
           if (this.process === child) {
             this.process = null;
+            const exitMsg = `cloudflared exited unexpectedly (code=${code ?? "null"}, signal=${signal ?? "null"}).`;
             this.snapshot = {
               ...this.snapshot,
               status: "stopped",
               publicBaseUrl: null,
               source: null,
-              lastError: `cloudflared exited unexpectedly (code=${code ?? "null"}, signal=${signal ?? "null"}).`,
+              lastError: exitMsg,
             };
+            console.warn(`[mt-node] cloudflared: ${exitMsg} tunnel will restart on next sync.`);
           }
           return;
         }
@@ -859,12 +869,15 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(port, host, () => {
+  const tunnelSnapshot = tunnelManager.getSnapshot();
   console.log(`[mt-node] listening on http://${host}:${port}`);
   console.log(`[mt-node] data dir: ${paths.dataDir}`);
   console.log(`[mt-node] config path: ${paths.configPath}`);
   console.log(`[mt-node] videos path: ${paths.videosPath}`);
   console.log(`[mt-node] managed cloudflared path: ${paths.managedCloudflaredPath}`);
-  if (tunnelManager.getSnapshot().mode !== "off") {
+  console.log(`[mt-node] tunnel mode: ${tunnelSnapshot.mode}${tunnelSnapshot.publicBaseUrl ? ` (env url: ${tunnelSnapshot.publicBaseUrl})` : ""}`);
+  console.log(`[mt-node] videos loaded: ${videos.length} (${videos.filter((v) => v.machineTube.videoId).length} published to MachineTube)`);
+  if (tunnelSnapshot.mode !== "off") {
     void tunnelManager.ensureStarted().catch((error) => {
       console.error(`[mt-node] tunnel start failed: ${formatError(error)}`);
     });
@@ -1423,18 +1436,22 @@ async function refreshExternalVideoOriginInMachineTube(input: {
 
 async function syncPublishedVideoOrigins(): Promise<void> {
   if (!hasCompleteMachineTubeCredentials(config.machineTube)) {
+    console.log("[mt-node] sync: skipping — MachineTube credentials not configured");
     return;
   }
 
-  if (videos.every((video) => !video.machineTube.videoId)) {
+  const publishedVideos = videos.filter((video) => video.machineTube.videoId);
+  if (publishedVideos.length === 0) {
     return;
   }
 
   const tunnel = await tunnelManager.ensureStarted();
   if (!tunnel.publicBaseUrl) {
+    console.warn(`[mt-node] sync: skipping — tunnel not online (status=${tunnel.status}${tunnel.lastError ? `, error: ${tunnel.lastError}` : ""})`);
     return;
   }
 
+  console.log(`[mt-node] sync: running for ${publishedVideos.length} published video(s) via ${tunnel.publicBaseUrl}`);
   let changed = false;
 
   for (const video of videos) {
@@ -1460,8 +1477,13 @@ async function syncPublishedVideoOrigins(): Promise<void> {
         video.machineTube.lastSyncedAt = new Date().toISOString();
         changed = true;
       }
+      console.log(`[mt-node] sync: video ${video.machineTube.videoId} (${video.fileName}) — urls up to date`);
       continue;
     }
+
+    console.log(`[mt-node] sync: video ${video.machineTube.videoId} (${video.fileName}) — pushing updated urls`);
+    console.log(`[mt-node] sync:   sourceUrl  → ${nextSourceUrl}`);
+    console.log(`[mt-node] sync:   playbackUrl → ${nextPlaybackUrl}`);
 
     try {
       await refreshExternalVideoOriginInMachineTube({
@@ -1479,9 +1501,11 @@ async function syncPublishedVideoOrigins(): Promise<void> {
       video.machineTube.lastSyncedAt = new Date().toISOString();
       video.machineTube.lastSyncError = null;
       changed = true;
+      console.log(`[mt-node] sync: video ${video.machineTube.videoId} — origin refreshed ok`);
     } catch (error) {
       video.machineTube.lastSyncError = formatError(error);
       changed = true;
+      console.error(`[mt-node] sync: video ${video.machineTube.videoId} — origin refresh failed: ${formatError(error)}`);
     }
   }
 
