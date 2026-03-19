@@ -22,8 +22,6 @@
     "typescript": "^5.9.3"
   },
   "dependencies": {
-    "node-pre-gyp": "^0.17.0",
-    "webtorrent": "^2.8.4",
-    "webtorrent-hybrid": "^5.0.2"
+    "webtorrent": "^2.8.4"
   }
 }

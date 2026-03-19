@@ -1,5 +1,4 @@
 const WEBTORRENT_MODULE = "webtorrent";
-const WEBTORRENT_HYBRID_MODULE = "webtorrent-hybrid";
 
 export const DEFAULT_WEBTORRENT_TRACKERS = [
   "wss://tracker.openwebtorrent.com",
@@ -28,7 +27,6 @@ type TorrentHandle = {
 
 type LoadedTorrentClient = {
   Constructor: TorrentClientConstructor;
-  engine: "webtorrent-hybrid" | "webtorrent";
   browserPeerCompatible: boolean;
 };
 
@@ -47,7 +45,7 @@ export type PersistedTorrentOutput = {
 
 export type TorrentRuntimeSnapshot = {
   status: "disabled" | "pending" | "seeding" | "error";
-  engine: "webtorrent-hybrid" | "webtorrent" | null;
+  engine: "webtorrent" | null;
   browserPeerCompatible: boolean;
   degradedReason: string | null;
   infoHash: string | null;
@@ -79,36 +77,17 @@ type ActiveSeedState = {
   pending: Promise<PersistedTorrentOutput | null> | null;
 };
 
-async function importTorrentConstructor(moduleName: string): Promise<TorrentClientConstructor> {
-  const imported = (await import(moduleName)) as { default?: unknown };
+async function loadTorrentClient(): Promise<LoadedTorrentClient> {
+  const imported = (await import(WEBTORRENT_MODULE)) as { default?: unknown };
   const constructorCandidate = imported.default ?? imported;
   if (typeof constructorCandidate !== "function") {
-    throw new Error(`${moduleName} did not export a client constructor.`);
+    throw new Error(`${WEBTORRENT_MODULE} did not export a client constructor.`);
   }
 
-  return constructorCandidate as TorrentClientConstructor;
-}
-
-async function loadPreferredTorrentClient(): Promise<LoadedTorrentClient> {
-  try {
-    return {
-      Constructor: await importTorrentConstructor(WEBTORRENT_HYBRID_MODULE),
-      engine: "webtorrent-hybrid",
-      browserPeerCompatible: true,
-    };
-  } catch (error) {
-    const fallbackReason = error instanceof Error ? error.message : String(error);
-    try {
-      return {
-        Constructor: await importTorrentConstructor(WEBTORRENT_MODULE),
-        engine: "webtorrent",
-        browserPeerCompatible: false,
-      };
-    } catch (fallbackError) {
-      const fallbackMessage = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
-      throw new Error(`Failed to load torrent client. hybrid=${fallbackReason}; fallback=${fallbackMessage}`);
-    }
-  }
+  return {
+    Constructor: constructorCandidate as TorrentClientConstructor,
+    browserPeerCompatible: true,
+  };
 }
 
 export function buildMagnetUrl(input: {
@@ -164,7 +143,6 @@ export class TorrentManager {
   private readonly seeds = new Map<string, ActiveSeedState>();
   private client: TorrentClient | null = null;
   private clientPromise: Promise<TorrentClient> | null = null;
-  private engine: "webtorrent-hybrid" | "webtorrent" | null = null;
   private runtimeBrowserPeerCompatible = false;
   private browserPeerCompatible = false;
   private runtimeChecked = false;
@@ -182,7 +160,7 @@ export class TorrentManager {
     this.enabled = input.mode !== "off";
     this.trackers = [...new Set(input.trackers)];
     this.hasBrowserCompatibleTrackers = this.trackers.some((tracker) => isBrowserCompatibleTracker(tracker));
-    this.clientLoader = input.clientLoader ?? loadPreferredTorrentClient;
+    this.clientLoader = input.clientLoader ?? loadTorrentClient;
     this.maxActiveTorrents =
       typeof input.maxActiveTorrents === "number" && Number.isFinite(input.maxActiveTorrents) && input.maxActiveTorrents > 0
         ? Math.floor(input.maxActiveTorrents)
@@ -323,7 +301,7 @@ export class TorrentManager {
 
     return {
       status: lastError ? "error" : infoHash ? "seeding" : "pending",
-      engine: this.engine,
+      engine: this.runtimeChecked ? "webtorrent" : null,
       browserPeerCompatible: this.browserPeerCompatible,
       degradedReason,
       infoHash,
@@ -351,7 +329,7 @@ export class TorrentManager {
     mode: PeerDeliveryMode;
     enabled: boolean;
     runtimeChecked: boolean;
-    engine: "webtorrent-hybrid" | "webtorrent" | null;
+    engine: "webtorrent" | null;
     browserPeerCompatible: boolean;
     hasBrowserCompatibleTrackers: boolean;
     trackerUrls: string[];
@@ -364,7 +342,7 @@ export class TorrentManager {
       mode: this.mode,
       enabled: this.enabled,
       runtimeChecked: this.runtimeChecked,
-      engine: this.engine,
+      engine: this.runtimeChecked ? "webtorrent" : null,
       browserPeerCompatible: this.browserPeerCompatible,
       hasBrowserCompatibleTrackers: this.hasBrowserCompatibleTrackers,
       trackerUrls: [...this.trackers],
@@ -398,7 +376,6 @@ export class TorrentManager {
       this.clientPromise = this.clientLoader()
         .then((loaded) => {
           this.runtimeChecked = true;
-          this.engine = loaded.engine;
           this.runtimeBrowserPeerCompatible = loaded.browserPeerCompatible;
           this.refreshCompatibilityState();
           this.startupError = null;
@@ -493,10 +470,6 @@ export class TorrentManager {
 
     if (!this.hasBrowserCompatibleTrackers) {
       return "Peer delivery requires at least one wss:// tracker for browser viewers.";
-    }
-
-    if (this.engine === "webtorrent") {
-      return "mt-node is running with plain webtorrent fallback, so browser/WebRTC peers will not connect.";
     }
 
     return null;

@@ -21,7 +21,6 @@ test("TorrentManager seeds once and derives a runtime snapshot", async () => {
     mode: "assist",
     trackers: ["wss://tracker.example/announce"],
     clientLoader: async () => ({
-      engine: "webtorrent-hybrid",
       browserPeerCompatible: true,
       Constructor: class FakeClient {
         seed(input: string, _opts: unknown, onSeed: (torrent: any) => void) {
@@ -70,7 +69,7 @@ test("TorrentManager seeds once and derives a runtime snapshot", async () => {
   });
 
   assert.equal(snapshot.status, "seeding");
-  assert.equal(snapshot.engine, "webtorrent-hybrid");
+  assert.equal(snapshot.engine, "webtorrent");
   assert.equal(snapshot.browserPeerCompatible, true);
   assert.equal(snapshot.degradedReason, null);
   assert.equal(manager.getEngineSnapshot().mode, "assist");
@@ -87,65 +86,6 @@ test("TorrentManager seeds once and derives a runtime snapshot", async () => {
   await manager.destroy();
 });
 
-test("TorrentManager reports degraded browser delivery when it falls back to plain webtorrent", async () => {
-  const manager = new TorrentManager({
-    mode: "assist",
-    trackers: ["wss://tracker.example/announce"],
-    clientLoader: async () => ({
-      engine: "webtorrent",
-      browserPeerCompatible: false,
-      Constructor: class FakeClient {
-        seed(_input: string, _opts: unknown, onSeed: (torrent: any) => void) {
-          const torrent = {
-            infoHash: "fedcba9876543210fedcba9876543210fedcba98",
-            numPeers: 0,
-            on() {
-              // no-op
-            },
-            destroy() {
-              // no-op
-            },
-          };
-
-          queueMicrotask(() => {
-            onSeed(torrent);
-          });
-
-          return torrent;
-        }
-
-        destroy(callback?: () => void) {
-          callback?.();
-        }
-      },
-    }),
-  });
-
-  const persisted = await manager.ensureSeed({
-    videoId: "vid_plain",
-    filePath: "/videos/plain.mp4",
-    fileSignature: "2048:plain",
-    displayName: "plain.mp4",
-  });
-
-  const snapshot = manager.getSnapshot({
-    videoId: "vid_plain",
-    displayName: "plain.mp4",
-    playbackUrl: "https://origin.example/media/plain.mp4",
-    persisted,
-  });
-  const engine = manager.getEngineSnapshot();
-
-  assert.equal(snapshot.engine, "webtorrent");
-  assert.equal(snapshot.browserPeerCompatible, false);
-  assert.match(String(snapshot.degradedReason ?? ""), /plain webtorrent/i);
-  assert.equal(engine.engine, "webtorrent");
-  assert.equal(engine.browserPeerCompatible, false);
-  assert.match(String(engine.degradedReason ?? ""), /plain webtorrent/i);
-
-  await manager.destroy();
-});
-
 test("TorrentManager enforces max active torrent guardrails", async () => {
   let seedCalls = 0;
   const manager = new TorrentManager({
@@ -153,7 +93,6 @@ test("TorrentManager enforces max active torrent guardrails", async () => {
     trackers: ["wss://tracker.example/announce"],
     maxActiveTorrents: 1,
     clientLoader: async () => ({
-      engine: "webtorrent-hybrid",
       browserPeerCompatible: true,
       Constructor: class FakeClient {
         seed(_input: string, _opts: unknown, onSeed: (torrent: any) => void) {
@@ -219,7 +158,6 @@ test("TorrentManager reports degraded browser delivery when trackers are not bro
     mode: "permanent",
     trackers: ["udp://tracker.example:1337/announce"],
     clientLoader: async () => ({
-      engine: "webtorrent-hybrid",
       browserPeerCompatible: true,
       Constructor: class FakeClient {
         seed(_input: string, _opts: unknown, onSeed: (torrent: any) => void) {
@@ -267,7 +205,7 @@ test("TorrentManager reports degraded browser delivery when trackers are not bro
   assert.equal(engine.mode, "permanent");
   assert.equal(engine.runtimeChecked, true);
   assert.equal(engine.hasBrowserCompatibleTrackers, false);
-  assert.equal(snapshot.engine, "webtorrent-hybrid");
+  assert.equal(snapshot.engine, "webtorrent");
   assert.equal(snapshot.browserPeerCompatible, false);
   assert.match(String(snapshot.degradedReason ?? ""), /wss:\/\//i);
   assert.match(String(engine.degradedReason ?? ""), /wss:\/\//i);
