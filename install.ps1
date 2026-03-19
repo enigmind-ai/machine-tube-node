@@ -78,10 +78,25 @@ try {
     $PreserveDir = Join-Path $TmpDir "preserve"
     New-Item -ItemType Directory -Force -Path $PreserveDir | Out-Null
 
+    # Move away from $InstallDir before removing it. Windows holds a handle on
+    # the shell's CWD, which causes Remove-Item to fail if the terminal is
+    # sitting inside the install directory.
+    Set-Location $TmpDir
+
     if (Test-Path $InstallDir) {
         Write-Host "Replacing mt-node install in $InstallDir"
         Preserve-RuntimeState -InstallDir $InstallDir -ConfigEnvPath $ConfigEnvPath -PreserveDir $PreserveDir
-        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $InstallDir
+        Remove-Item -Recurse -Force $InstallDir
+
+        # Windows can take a moment to fully release directory handles after removal.
+        $deadline = [DateTime]::UtcNow.AddSeconds(10)
+        while ((Test-Path $InstallDir) -and ([DateTime]::UtcNow -lt $deadline)) {
+            Start-Sleep -Milliseconds 200
+        }
+        if (Test-Path $InstallDir) {
+            Write-Error "Could not remove '$InstallDir'. Make sure mt-node is not running and your terminal's working directory is not inside that folder, then try again."
+            exit 1
+        }
     } else {
         Write-Host "Installing mt-node into $InstallDir"
     }
