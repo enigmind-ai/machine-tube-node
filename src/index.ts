@@ -37,6 +37,21 @@ type MtNodeConfig = {
   createdAt: string;
 };
 
+type MachineTubePublishRecord = {
+  lastPublishedAt: string | null;
+  lastSyncedAt: string | null;
+  lastSyncError: string | null;
+  videoId: string;
+  watchUrl: string | null;
+  status: string | null;
+  title: string | null;
+  durationSeconds: number | null;
+  externalPlaybackUrl: string | null;
+  externalPlaybackHlsUrl: string | null;
+  externalThumbnailUrl: string | null;
+  sourceUrl: string | null;
+};
+
 type RegisteredVideo = {
   id: string;
   filePath: string;
@@ -64,6 +79,7 @@ type RegisteredVideo = {
     externalPlaybackHlsUrl: string | null;
     externalThumbnailUrl: string | null;
     sourceUrl: string | null;
+    publishHistory: MachineTubePublishRecord[];
   };
 };
 
@@ -830,11 +846,11 @@ const server = http.createServer(async (req, res) => {
         console.log(`[mt-node] credentials saved to config from publish request (agentId=${credentialsResult.credentials.agentId})`);
       }
 
-      video.machineTube = {
+      upsertMachineTubePublishRecord(video.machineTube, createMachineTubePublishRecord({
         lastPublishedAt: new Date().toISOString(),
         lastSyncedAt: new Date().toISOString(),
         lastSyncError: null,
-        videoId: publishResult.videoId,
+        videoId: String(publishResult.videoId),
         watchUrl: publishResult.watchUrl,
         status: publishResult.status,
         title,
@@ -843,7 +859,7 @@ const server = http.createServer(async (req, res) => {
         externalPlaybackHlsUrl,
         externalThumbnailUrl,
         sourceUrl: normalizeOptionalString(body.sourceUrl) ?? `${tunnel.publicBaseUrl}/heartbeat`,
-      };
+      }));
       persistVideos();
 
       console.log(`[mt-node] publish: published to MachineTube — videoId=${publishResult.videoId}, watchUrl=${publishResult.watchUrl}`);
@@ -922,7 +938,7 @@ server.listen(port, host, () => {
   console.log(`[mt-node] videos path: ${paths.videosPath}`);
   console.log(`[mt-node] managed cloudflared path: ${paths.managedCloudflaredPath}`);
   console.log(`[mt-node] tunnel mode: ${tunnelSnapshot.mode}${tunnelSnapshot.publicBaseUrl ? ` (env url: ${tunnelSnapshot.publicBaseUrl})` : ""}`);
-  console.log(`[mt-node] videos loaded: ${videos.length} (${videos.filter((v) => v.machineTube.videoId).length} published to MachineTube)`);
+  console.log(`[mt-node] videos loaded: ${videos.length} (${countPublishedMachineTubeVideos()} published to MachineTube)`);
   if (tunnelSnapshot.mode !== "off") {
     void tunnelManager.ensureStarted().catch((error) => {
       console.error(`[mt-node] tunnel start failed: ${formatError(error)}`);
@@ -990,20 +1006,7 @@ async function ensureRegisteredVideo(filePath: string):
       lastPreparedAt: null,
       lastPreparationError: null,
     },
-    machineTube: {
-      lastPublishedAt: null,
-      lastSyncedAt: null,
-      lastSyncError: null,
-      videoId: null,
-      watchUrl: null,
-      status: null,
-      title: null,
-      durationSeconds: null,
-      externalPlaybackUrl: null,
-      externalPlaybackHlsUrl: null,
-      externalThumbnailUrl: null,
-      sourceUrl: null,
-    },
+    machineTube: createEmptyMachineTubeState(),
   };
 
   await ensureVideoOutputs(video);
@@ -1160,6 +1163,103 @@ function persistVideos(): void {
 
 function persistConfig(): void {
   writeFileSync(paths.configPath, JSON.stringify(config, null, 2));
+}
+
+function createEmptyMachineTubeState(): RegisteredVideo["machineTube"] {
+  return {
+    lastPublishedAt: null,
+    lastSyncedAt: null,
+    lastSyncError: null,
+    videoId: null,
+    watchUrl: null,
+    status: null,
+    title: null,
+    durationSeconds: null,
+    externalPlaybackUrl: null,
+    externalPlaybackHlsUrl: null,
+    externalThumbnailUrl: null,
+    sourceUrl: null,
+    publishHistory: [],
+  };
+}
+
+function createMachineTubePublishRecord(input: {
+  lastPublishedAt: string | null;
+  lastSyncedAt: string | null;
+  lastSyncError: string | null;
+  videoId: string;
+  watchUrl: string | null;
+  status: string | null;
+  title: string | null;
+  durationSeconds: number | null;
+  externalPlaybackUrl: string | null;
+  externalPlaybackHlsUrl: string | null;
+  externalThumbnailUrl: string | null;
+  sourceUrl: string | null;
+}): MachineTubePublishRecord {
+  return {
+    lastPublishedAt: input.lastPublishedAt,
+    lastSyncedAt: input.lastSyncedAt,
+    lastSyncError: input.lastSyncError,
+    videoId: input.videoId,
+    watchUrl: input.watchUrl,
+    status: input.status,
+    title: input.title,
+    durationSeconds: input.durationSeconds,
+    externalPlaybackUrl: input.externalPlaybackUrl,
+    externalPlaybackHlsUrl: input.externalPlaybackHlsUrl,
+    externalThumbnailUrl: input.externalThumbnailUrl,
+    sourceUrl: input.sourceUrl,
+  };
+}
+
+function applyMachineTubePublishRecord(machineTube: RegisteredVideo["machineTube"], record: MachineTubePublishRecord | null): void {
+  if (!record) {
+    const emptyState = createEmptyMachineTubeState();
+    machineTube.lastPublishedAt = emptyState.lastPublishedAt;
+    machineTube.lastSyncedAt = emptyState.lastSyncedAt;
+    machineTube.lastSyncError = emptyState.lastSyncError;
+    machineTube.videoId = emptyState.videoId;
+    machineTube.watchUrl = emptyState.watchUrl;
+    machineTube.status = emptyState.status;
+    machineTube.title = emptyState.title;
+    machineTube.durationSeconds = emptyState.durationSeconds;
+    machineTube.externalPlaybackUrl = emptyState.externalPlaybackUrl;
+    machineTube.externalPlaybackHlsUrl = emptyState.externalPlaybackHlsUrl;
+    machineTube.externalThumbnailUrl = emptyState.externalThumbnailUrl;
+    machineTube.sourceUrl = emptyState.sourceUrl;
+    return;
+  }
+
+  machineTube.lastPublishedAt = record.lastPublishedAt;
+  machineTube.lastSyncedAt = record.lastSyncedAt;
+  machineTube.lastSyncError = record.lastSyncError;
+  machineTube.videoId = record.videoId;
+  machineTube.watchUrl = record.watchUrl;
+  machineTube.status = record.status;
+  machineTube.title = record.title;
+  machineTube.durationSeconds = record.durationSeconds;
+  machineTube.externalPlaybackUrl = record.externalPlaybackUrl;
+  machineTube.externalPlaybackHlsUrl = record.externalPlaybackHlsUrl;
+  machineTube.externalThumbnailUrl = record.externalThumbnailUrl;
+  machineTube.sourceUrl = record.sourceUrl;
+}
+
+function upsertMachineTubePublishRecord(
+  machineTube: RegisteredVideo["machineTube"],
+  record: MachineTubePublishRecord
+): void {
+  const existingIndex = machineTube.publishHistory.findIndex((entry) => entry.videoId === record.videoId);
+  if (existingIndex >= 0) {
+    machineTube.publishHistory[existingIndex] = record;
+  } else {
+    machineTube.publishHistory.push(record);
+  }
+  applyMachineTubePublishRecord(machineTube, record);
+}
+
+function listPublishedMachineTubeRecords(video: RegisteredVideo): MachineTubePublishRecord[] {
+  return video.machineTube.publishHistory.filter((entry) => Boolean(entry.videoId));
 }
 
 function toVideoResponse(video: RegisteredVideo, req: IncomingMessage): JsonRecord {
@@ -1495,8 +1595,10 @@ async function syncPublishedVideoOrigins(): Promise<void> {
     return;
   }
 
-  const publishedVideos = videos.filter((video) => video.machineTube.videoId);
-  if (publishedVideos.length === 0) {
+  const publishedTargets = videos.flatMap((video) =>
+    listPublishedMachineTubeRecords(video).map((publishRecord) => ({ video, publishRecord }))
+  );
+  if (publishedTargets.length === 0) {
     return;
   }
 
@@ -1511,65 +1613,70 @@ async function syncPublishedVideoOrigins(): Promise<void> {
     return;
   }
 
-  console.log(`[mt-node] sync: running for ${publishedVideos.length} published video(s) via ${tunnel.publicBaseUrl}`);
+  console.log(`[mt-node] sync: running for ${publishedTargets.length} published video(s) via ${tunnel.publicBaseUrl}`);
   let changed = false;
 
-  for (const video of videos) {
-    if (!video.machineTube.videoId) {
-      continue;
-    }
-
+  for (const { video, publishRecord } of publishedTargets) {
     const nextPlaybackUrl = `${tunnel.publicBaseUrl}/media/${encodeURIComponent(video.id)}`;
     const nextPlaybackHlsUrl = video.outputs.hls ? `${tunnel.publicBaseUrl}/media/${encodeURIComponent(video.id)}/hls/index.m3u8` : null;
     const nextSourceUrl = `${tunnel.publicBaseUrl}/heartbeat`;
     const nextDurationSeconds = video.outputs.probe?.durationSeconds ?? null;
     const nextThumbnailUrl = video.outputs.thumbnail
       ? `${tunnel.publicBaseUrl}/media/${encodeURIComponent(video.id)}/thumbnail.jpg`
-      : video.machineTube.externalThumbnailUrl;
+      : publishRecord.externalThumbnailUrl;
 
     if (
-      video.machineTube.externalPlaybackUrl === nextPlaybackUrl &&
-      video.machineTube.externalPlaybackHlsUrl === nextPlaybackHlsUrl &&
-      video.machineTube.externalThumbnailUrl === nextThumbnailUrl &&
-      video.machineTube.durationSeconds === nextDurationSeconds &&
-      video.machineTube.sourceUrl === nextSourceUrl
+      publishRecord.externalPlaybackUrl === nextPlaybackUrl &&
+      publishRecord.externalPlaybackHlsUrl === nextPlaybackHlsUrl &&
+      publishRecord.externalThumbnailUrl === nextThumbnailUrl &&
+      publishRecord.durationSeconds === nextDurationSeconds &&
+      publishRecord.sourceUrl === nextSourceUrl
     ) {
-      if (video.machineTube.lastSyncError) {
-        video.machineTube.lastSyncError = null;
-        video.machineTube.lastSyncedAt = new Date().toISOString();
+      if (publishRecord.lastSyncError) {
+        publishRecord.lastSyncError = null;
+        publishRecord.lastSyncedAt = new Date().toISOString();
+        if (video.machineTube.videoId === publishRecord.videoId) {
+          applyMachineTubePublishRecord(video.machineTube, publishRecord);
+        }
         changed = true;
       }
-      console.log(`[mt-node] sync: video ${video.machineTube.videoId} (${video.fileName}) — urls up to date`);
+      console.log(`[mt-node] sync: video ${publishRecord.videoId} (${video.fileName}) — urls up to date`);
       continue;
     }
 
-    console.log(`[mt-node] sync: video ${video.machineTube.videoId} (${video.fileName}) — pushing updated urls`);
+    console.log(`[mt-node] sync: video ${publishRecord.videoId} (${video.fileName}) — pushing updated urls`);
     console.log(`[mt-node] sync:   sourceUrl  → ${nextSourceUrl}`);
     console.log(`[mt-node] sync:   playbackUrl → ${nextPlaybackUrl}`);
 
     try {
       await refreshExternalVideoOriginInMachineTube({
         credentials: config.machineTube,
-        videoId: video.machineTube.videoId,
+        videoId: publishRecord.videoId,
         externalPlaybackUrl: nextPlaybackUrl,
         externalPlaybackHlsUrl: nextPlaybackHlsUrl,
         externalThumbnailUrl: nextThumbnailUrl,
         durationSeconds: nextDurationSeconds,
         sourceUrl: nextSourceUrl,
       });
-      video.machineTube.externalPlaybackUrl = nextPlaybackUrl;
-      video.machineTube.externalPlaybackHlsUrl = nextPlaybackHlsUrl;
-      video.machineTube.externalThumbnailUrl = nextThumbnailUrl;
-      video.machineTube.durationSeconds = nextDurationSeconds;
-      video.machineTube.sourceUrl = nextSourceUrl;
-      video.machineTube.lastSyncedAt = new Date().toISOString();
-      video.machineTube.lastSyncError = null;
+      publishRecord.externalPlaybackUrl = nextPlaybackUrl;
+      publishRecord.externalPlaybackHlsUrl = nextPlaybackHlsUrl;
+      publishRecord.externalThumbnailUrl = nextThumbnailUrl;
+      publishRecord.durationSeconds = nextDurationSeconds;
+      publishRecord.sourceUrl = nextSourceUrl;
+      publishRecord.lastSyncedAt = new Date().toISOString();
+      publishRecord.lastSyncError = null;
+      if (video.machineTube.videoId === publishRecord.videoId) {
+        applyMachineTubePublishRecord(video.machineTube, publishRecord);
+      }
       changed = true;
-      console.log(`[mt-node] sync: video ${video.machineTube.videoId} — origin refreshed ok`);
+      console.log(`[mt-node] sync: video ${publishRecord.videoId} — origin refreshed ok`);
     } catch (error) {
-      video.machineTube.lastSyncError = formatError(error);
+      publishRecord.lastSyncError = formatError(error);
+      if (video.machineTube.videoId === publishRecord.videoId) {
+        applyMachineTubePublishRecord(video.machineTube, publishRecord);
+      }
       changed = true;
-      console.error(`[mt-node] sync: video ${video.machineTube.videoId} — origin refresh failed: ${formatError(error)}`);
+      console.error(`[mt-node] sync: video ${publishRecord.videoId} — origin refresh failed: ${formatError(error)}`);
     }
   }
 
@@ -1705,6 +1812,26 @@ function normalizeRegisteredVideo(value: unknown): RegisteredVideo | null {
         .map((file) => normalizeGeneratedHlsFile(file))
         .filter((file): file is GeneratedHlsFile => file !== null)
     : [];
+  const publishHistory = Array.isArray(machineTube?.publishHistory)
+    ? machineTube.publishHistory
+        .map((entry) => normalizeMachineTubePublishRecord(entry))
+        .filter((entry): entry is MachineTubePublishRecord => entry !== null)
+    : [];
+  const legacyCurrentPublish = normalizeMachineTubePublishRecord(machineTube);
+
+  if (
+    legacyCurrentPublish &&
+    !publishHistory.some((entry) => entry.videoId === legacyCurrentPublish.videoId)
+  ) {
+    publishHistory.push(legacyCurrentPublish);
+  }
+
+  const currentPublishRecord =
+    (legacyCurrentPublish
+      ? publishHistory.find((entry) => entry.videoId === legacyCurrentPublish.videoId) ?? legacyCurrentPublish
+      : null) ??
+    publishHistory[publishHistory.length - 1] ??
+    null;
 
   return {
     id: normalizeOptionalString(record.id) ?? createId("vid"),
@@ -1729,22 +1856,40 @@ function normalizeRegisteredVideo(value: unknown): RegisteredVideo | null {
       lastPreparationError: normalizeOptionalString(outputs?.lastPreparationError),
     },
     machineTube: {
-      lastPublishedAt: normalizeOptionalString(machineTube?.lastPublishedAt),
-      lastSyncedAt: normalizeOptionalString(machineTube?.lastSyncedAt),
-      lastSyncError: normalizeOptionalString(machineTube?.lastSyncError),
-      videoId: normalizeOptionalString(machineTube?.videoId),
-      watchUrl: normalizeOptionalString(machineTube?.watchUrl),
-      status: normalizeOptionalString(machineTube?.status),
-      title: normalizeOptionalString(machineTube?.title),
-      durationSeconds:
-        typeof machineTube?.durationSeconds === "number" && Number.isFinite(machineTube.durationSeconds)
-          ? Math.round(machineTube.durationSeconds)
-          : null,
-      externalPlaybackUrl: normalizeOptionalString(machineTube?.externalPlaybackUrl),
-      externalPlaybackHlsUrl: normalizeOptionalString(machineTube?.externalPlaybackHlsUrl),
-      externalThumbnailUrl: normalizeOptionalString(machineTube?.externalThumbnailUrl),
-      sourceUrl: normalizeOptionalString(machineTube?.sourceUrl),
+      ...createEmptyMachineTubeState(),
+      publishHistory,
+      ...(currentPublishRecord ?? {}),
     },
+  };
+}
+
+function normalizeMachineTubePublishRecord(value: unknown): MachineTubePublishRecord | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+
+  const record = value as JsonRecord;
+  const videoId = normalizeOptionalString(record.videoId);
+  if (!videoId) {
+    return null;
+  }
+
+  return {
+    lastPublishedAt: normalizeOptionalString(record.lastPublishedAt),
+    lastSyncedAt: normalizeOptionalString(record.lastSyncedAt),
+    lastSyncError: normalizeOptionalString(record.lastSyncError),
+    videoId,
+    watchUrl: normalizeOptionalString(record.watchUrl),
+    status: normalizeOptionalString(record.status),
+    title: normalizeOptionalString(record.title),
+    durationSeconds:
+      typeof record.durationSeconds === "number" && Number.isFinite(record.durationSeconds)
+        ? Math.round(record.durationSeconds)
+        : null,
+    externalPlaybackUrl: normalizeOptionalString(record.externalPlaybackUrl),
+    externalPlaybackHlsUrl: normalizeOptionalString(record.externalPlaybackHlsUrl),
+    externalThumbnailUrl: normalizeOptionalString(record.externalThumbnailUrl),
+    sourceUrl: normalizeOptionalString(record.sourceUrl),
   };
 }
 
@@ -1814,7 +1959,7 @@ function normalizeGeneratedHlsFile(value: unknown): GeneratedHlsFile | null {
 }
 
 function countPublishedMachineTubeVideos(): number {
-  return videos.filter((video) => Boolean(video.machineTube.videoId)).length;
+  return videos.reduce((total, video) => total + listPublishedMachineTubeRecords(video).length, 0);
 }
 
 function buildHeartbeatPayload(req: IncomingMessage): JsonRecord {
@@ -1842,19 +1987,19 @@ function buildHeartbeatPayload(req: IncomingMessage): JsonRecord {
       agentId: config.machineTube.agentId || null,
     },
     publishedVideos: videos
-      .filter((video) => Boolean(video.machineTube.videoId))
-      .map((video) => {
+      .flatMap((video) => listPublishedMachineTubeRecords(video).map((publishRecord) => ({ video, publishRecord })))
+      .map(({ video, publishRecord }) => {
         const response = toVideoResponse(video, req);
         return {
           localVideoId: video.id,
-          machineTubeVideoId: video.machineTube.videoId,
-          machineTubeWatchUrl: video.machineTube.watchUrl,
+          machineTubeVideoId: publishRecord.videoId,
+          machineTubeWatchUrl: publishRecord.watchUrl,
           playbackUrl: response.playbackUrl,
           hlsPlaybackUrl: response.hlsPlaybackUrl,
           thumbnailUrl: response.thumbnailUrl,
-          title: video.machineTube.title ?? video.fileName,
-          lastPublishedAt: video.machineTube.lastPublishedAt,
-          machineTubeStatus: video.machineTube.status,
+          title: publishRecord.title ?? video.fileName,
+          lastPublishedAt: publishRecord.lastPublishedAt,
+          machineTubeStatus: publishRecord.status,
         };
       }),
   };
