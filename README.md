@@ -77,7 +77,7 @@ The watch page prefers HLS when present, can attempt torrent playback when a mag
 
 MachineTube publish and origin-refresh calls now include `externalPlaybackMagnetUrl` when torrent seeding is healthy.
 
-`mt-node` prefers `webtorrent-hybrid` so browser WebRTC peers can connect. If that runtime is unavailable it falls back to plain `webtorrent`, keeps HTTPS playback working, and reports the torrent path as degraded for browser viewers. A healthy browser-compatible setup also requires at least one `wss://` tracker; otherwise the node reports the peer path as degraded even if torrent seeding still works for non-browser peers.
+`mt-node` uses `webtorrent` (≥2.3.0), which includes native WebRTC support, so browser peers can always connect without any additional runtime. A healthy browser-compatible setup also requires at least one `wss://` tracker; otherwise the node reports the peer path as degraded even if torrent seeding still works for non-browser peers.
 
 `MT_NODE_PEER_DELIVERY_MODE=permanent` now restores previously published torrent seeds on restart without republishing the videos to MachineTube. Status payloads also expose:
 
