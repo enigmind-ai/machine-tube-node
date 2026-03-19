@@ -78,6 +78,13 @@ async function listen(server: http.Server): Promise<number> {
   return address.port;
 }
 
+async function reservePort(): Promise<number> {
+  const server = http.createServer();
+  const port = await listen(server);
+  await new Promise((resolve) => server.close(resolve));
+  return port;
+}
+
 test("tracks publish history when the same file is published to MachineTube multiple times", async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), "mt-node-publish-history-"));
   const dataDir = path.join(tempRoot, "data");
@@ -118,7 +125,7 @@ test("tracks publish history when the same file is published to MachineTube mult
 
   try {
     const machineTubePort = await listen(machineTubeServer);
-    const mtNodePort = machineTubePort + 1;
+    const mtNodePort = await reservePort();
     const baseUrl = `http://127.0.0.1:${mtNodePort}`;
 
     runOrThrow("node", [bootstrapEntry], {

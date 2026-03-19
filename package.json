@@ -20,5 +20,10 @@
     "@types/node": "^24.6.1",
     "tsx": "^4.20.5",
     "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "node-pre-gyp": "^0.17.0",
+    "webtorrent": "^2.8.4",
+    "webtorrent-hybrid": "^5.0.2"
   }
 }

@@ -10,6 +10,7 @@ $BinDir    = if ($env:MT_NODE_BIN_DIR)      { $env:MT_NODE_BIN_DIR }      else {
 $InboxDir  = if ($env:MT_NODE_INBOX_DIR)    { $env:MT_NODE_INBOX_DIR }    else { Join-Path $HOME "MachineTube\videos" }
 $Mode      = if ($env:MT_NODE_MODE)         { $env:MT_NODE_MODE }         else { "local" }
 $WrapperPath = Join-Path $BinDir "mt-node.cmd"
+$ConfigEnvPath = Join-Path $InstallDir "config.env"
 
 function Need-Cmd($cmd) {
     if (-not (Get-Command $cmd -ErrorAction SilentlyContinue)) {
@@ -66,6 +67,9 @@ if (Test-Path (Join-Path $InstallDir "package-lock.json")) {
 Write-Host "Building mt-node"
 npm run build
 
+Write-Host "Creating default mt-node config file"
+node "$InstallDir\dist\index.js" config init
+
 Write-Host "Preparing managed media tools"
 node "$InstallDir\scripts\bootstrap-media-tools.mjs"
 
@@ -93,12 +97,19 @@ mt-node installed successfully.
 
 Install directory: $InstallDir
 Launcher:         $WrapperPath
+Config file:      $ConfigEnvPath
 MachineTube inbox: $InboxDir
 Mode: docker
+Peer delivery default: assist
 
 mt-node was launched as its own Docker container.
 Drop videos into the inbox folder and point OpenClaw at:
   http://localhost:43110
+
+To enable restart-restored seeding, edit:
+  $ConfigEnvPath
+and set:
+  MT_NODE_PEER_DELIVERY_MODE=permanent
 
 For built-in thumbnail and HLS output, mt-node can manage FFmpeg itself. See:
   $InstallDir\README.md
@@ -110,10 +121,17 @@ mt-node installed successfully.
 
 Install directory: $InstallDir
 Launcher:         $WrapperPath
+Config file:      $ConfigEnvPath
 MachineTube inbox: $InboxDir
 Mode: local
+Peer delivery default: assist
 
 Drop videos into the inbox folder, then start mt-node and publish the latest or a named inbox file.
+
+To enable restart-restored seeding, edit:
+  $ConfigEnvPath
+and set:
+  MT_NODE_PEER_DELIVERY_MODE=permanent
 
 For built-in thumbnail and HLS output, mt-node can manage FFmpeg itself. See:
   $InstallDir\README.md

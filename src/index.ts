@@ -17,6 +17,13 @@ import type { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { generateThumbnail, probeVideo, transcodeToHls, type MediaToolPaths, type VideoProbe } from "./media.js";
 import {
+  parseTrackerList,
+  type PeerDeliveryMode,
+  TorrentManager,
+  type PersistedTorrentOutput,
+  type TorrentRuntimeSnapshot,
+} from "./torrent.js";
+import {
   getHealthyTunnelSnapshot as resolveHealthyTunnelSnapshot,
   probePublicTunnelHeartbeat,
 } from "./tunnel-health.js";
@@ -48,6 +55,7 @@ type MachineTubePublishRecord = {
   durationSeconds: number | null;
   externalPlaybackUrl: string | null;
   externalPlaybackHlsUrl: string | null;
+  externalPlaybackMagnetUrl: string | null;
   externalThumbnailUrl: string | null;
   sourceUrl: string | null;
 };
@@ -63,6 +71,7 @@ type RegisteredVideo = {
     probe: VideoProbe | null;
     thumbnail: GeneratedAsset | null;
     hls: GeneratedHlsOutput | null;
+    torrent: PersistedTorrentOutput | null;
     lastPreparedAt: string | null;
     lastPreparationError: string | null;
   };
@@ -77,6 +86,7 @@ type RegisteredVideo = {
     durationSeconds: number | null;
     externalPlaybackUrl: string | null;
     externalPlaybackHlsUrl: string | null;
+    externalPlaybackMagnetUrl: string | null;
     externalThumbnailUrl: string | null;
     sourceUrl: string | null;
     publishHistory: MachineTubePublishRecord[];
@@ -85,6 +95,7 @@ type RegisteredVideo = {
 
 type RuntimePaths = {
   projectRoot: string;
+  envFilePath: string;
   dataDir: string;
   configPath: string;
   videosPath: string;
@@ -616,9 +627,13 @@ class TunnelManager {
 }
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+const projectRoot = resolve(__dirname, "..");
+const envFilePath = resolve(process.env.MT_NODE_ENV_FILE ?? resolve(projectRoot, "config.env"));
+loadEnvFile(envFilePath);
 const resolvedDataDir = resolve(process.env.MT_NODE_DATA_DIR ?? resolve(__dirname, "..", "data"));
 const paths: RuntimePaths = {
-  projectRoot: resolve(__dirname, ".."),
+  projectRoot,
+  envFilePath,
   dataDir: resolvedDataDir,
   configPath: resolve(process.env.MT_NODE_CONFIG_PATH ?? resolve(resolvedDataDir, "config.json")),
   videosPath: resolve(process.env.MT_NODE_VIDEOS_PATH ?? resolve(resolvedDataDir, "videos.json")),
@@ -630,6 +645,10 @@ const paths: RuntimePaths = {
       resolve(process.env.MT_NODE_BIN_DIR ?? resolve(resolvedDataDir, "bin"), managedCloudflaredFileName(process.platform)),
   ),
 };
+
+if (handleCliCommand(process.argv.slice(2), paths)) {
+  process.exit(0);
+}
 
 const port = parseNumber(process.env.MT_NODE_PORT, 43110);
 const host = process.env.MT_NODE_HOST?.trim() || "0.0.0.0";
@@ -653,6 +672,33 @@ const config = loadOrCreateConfig(paths.configPath, {
 const videos = loadOrCreateVideos(paths.videosPath);
 const tunnelManager = new TunnelManager(port, paths.managedCloudflaredPath);
 const mediaToolsManager = new MediaToolsManager(paths.binDir);
+const peerDeliveryMode = parsePeerDeliveryMode(
+  process.env.MT_NODE_PEER_DELIVERY_MODE,
+  process.env.MT_NODE_WEBTORRENT_ENABLED,
+);
+const peerDeliveryMaxActiveTorrents = parseOptionalPositiveNumber(process.env.MT_NODE_PEER_DELIVERY_MAX_ACTIVE_TORRENTS);
+const peerDeliveryMaxConnections = parseOptionalPositiveNumber(process.env.MT_NODE_PEER_DELIVERY_MAX_CONNECTIONS);
+const torrentManager = new TorrentManager({
+  mode: peerDeliveryMode,
+  trackers: parseTrackerList(process.env.MT_NODE_WEBTORRENT_TRACKERS),
+  clientOptions: {
+    torrentPort: parseNumber(process.env.MT_NODE_WEBTORRENT_PORT, 0),
+    dhtPort: parseNumber(process.env.MT_NODE_WEBTORRENT_DHT_PORT, 0),
+  },
+  maxActiveTorrents: peerDeliveryMaxActiveTorrents,
+  maxConnections: peerDeliveryMaxConnections,
+});
+void torrentManager.warmup().then(() => {
+  const peerDelivery = torrentManager.getEngineSnapshot();
+  if (peerDelivery.degradedReason) {
+    console.warn(`[mt-node] peer delivery degraded: ${peerDelivery.degradedReason}`);
+  }
+  if (peerDelivery.mode === "permanent") {
+    void restorePermanentPeerDeliverySeeds();
+  }
+}).catch((error) => {
+  console.warn(`[mt-node] peer delivery startup probe failed: ${formatError(error)}`);
+});
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
@@ -678,6 +724,7 @@ const server = http.createServer(async (req, res) => {
         runtime: runtimeEnvironment,
         tunnel: tunnelManager.getSnapshot(),
         mediaTools: mediaToolsManager.getSnapshot(),
+        peerDelivery: buildPeerDeliveryRuntimeSummary(),
         inbox: {
           availability: evaluateInboxAvailability(paths.inboxDir, runtimeEnvironment),
           files: listInboxFiles(),
@@ -790,6 +837,8 @@ const server = http.createServer(async (req, res) => {
       const externalPlaybackUrl = String(videoResponse.playbackUrl);
       const externalPlaybackHlsUrl =
         typeof videoResponse.hlsPlaybackUrl === "string" ? videoResponse.hlsPlaybackUrl : null;
+      const externalPlaybackMagnetUrl =
+        typeof videoResponse.torrentMagnetUrl === "string" ? videoResponse.torrentMagnetUrl : null;
       const externalThumbnailUrl =
         normalizeOptionalString(body.externalThumbnailUrl) ??
         (typeof videoResponse.thumbnailUrl === "string" ? videoResponse.thumbnailUrl : null);
@@ -805,6 +854,7 @@ const server = http.createServer(async (req, res) => {
           video: videoResponse,
           externalPlaybackUrl,
           externalPlaybackHlsUrl,
+          externalPlaybackMagnetUrl,
           externalThumbnailUrl,
           machineTube: { published: false, reason: "publishToMachineTube was set to false." },
         });
@@ -829,6 +879,7 @@ const server = http.createServer(async (req, res) => {
         credentials: credentialsResult.credentials,
         externalPlaybackUrl,
         externalPlaybackHlsUrl,
+        externalPlaybackMagnetUrl,
         externalThumbnailUrl,
         durationSeconds,
         title,
@@ -857,6 +908,7 @@ const server = http.createServer(async (req, res) => {
         durationSeconds,
         externalPlaybackUrl,
         externalPlaybackHlsUrl,
+        externalPlaybackMagnetUrl,
         externalThumbnailUrl,
         sourceUrl: normalizeOptionalString(body.sourceUrl) ?? `${tunnel.publicBaseUrl}/heartbeat`,
       }));
@@ -872,6 +924,7 @@ const server = http.createServer(async (req, res) => {
         video: toVideoResponse(video, req),
         externalPlaybackUrl,
         externalPlaybackHlsUrl,
+        externalPlaybackMagnetUrl,
         externalThumbnailUrl,
         machineTube: {
           published: true,
@@ -933,11 +986,13 @@ const server = http.createServer(async (req, res) => {
 server.listen(port, host, () => {
   const tunnelSnapshot = tunnelManager.getSnapshot();
   console.log(`[mt-node] listening on http://${host}:${port}`);
+  console.log(`[mt-node] env file: ${paths.envFilePath}${existsSync(paths.envFilePath) ? "" : " (not found, using runtime defaults)"}`);
   console.log(`[mt-node] data dir: ${paths.dataDir}`);
   console.log(`[mt-node] config path: ${paths.configPath}`);
   console.log(`[mt-node] videos path: ${paths.videosPath}`);
   console.log(`[mt-node] managed cloudflared path: ${paths.managedCloudflaredPath}`);
   console.log(`[mt-node] tunnel mode: ${tunnelSnapshot.mode}${tunnelSnapshot.publicBaseUrl ? ` (env url: ${tunnelSnapshot.publicBaseUrl})` : ""}`);
+  console.log(`[mt-node] peer delivery mode: ${peerDeliveryMode}`);
   console.log(`[mt-node] videos loaded: ${videos.length} (${countPublishedMachineTubeVideos()} published to MachineTube)`);
   if (tunnelSnapshot.mode !== "off") {
     void tunnelManager.ensureStarted().catch((error) => {
@@ -966,7 +1021,9 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, () => {
     clearInterval(syncTimer);
     tunnelManager.stop();
-    server.close(() => process.exit(0));
+    void torrentManager.destroy().finally(() => {
+      server.close(() => process.exit(0));
+    });
   });
 }
 
@@ -1003,6 +1060,7 @@ async function ensureRegisteredVideo(filePath: string):
       probe: null,
       thumbnail: null,
       hls: null,
+      torrent: null,
       lastPreparedAt: null,
       lastPreparationError: null,
     },
@@ -1177,6 +1235,7 @@ function createEmptyMachineTubeState(): RegisteredVideo["machineTube"] {
     durationSeconds: null,
     externalPlaybackUrl: null,
     externalPlaybackHlsUrl: null,
+    externalPlaybackMagnetUrl: null,
     externalThumbnailUrl: null,
     sourceUrl: null,
     publishHistory: [],
@@ -1194,6 +1253,7 @@ function createMachineTubePublishRecord(input: {
   durationSeconds: number | null;
   externalPlaybackUrl: string | null;
   externalPlaybackHlsUrl: string | null;
+  externalPlaybackMagnetUrl: string | null;
   externalThumbnailUrl: string | null;
   sourceUrl: string | null;
 }): MachineTubePublishRecord {
@@ -1208,6 +1268,7 @@ function createMachineTubePublishRecord(input: {
     durationSeconds: input.durationSeconds,
     externalPlaybackUrl: input.externalPlaybackUrl,
     externalPlaybackHlsUrl: input.externalPlaybackHlsUrl,
+    externalPlaybackMagnetUrl: input.externalPlaybackMagnetUrl,
     externalThumbnailUrl: input.externalThumbnailUrl,
     sourceUrl: input.sourceUrl,
   };
@@ -1226,6 +1287,7 @@ function applyMachineTubePublishRecord(machineTube: RegisteredVideo["machineTube
     machineTube.durationSeconds = emptyState.durationSeconds;
     machineTube.externalPlaybackUrl = emptyState.externalPlaybackUrl;
     machineTube.externalPlaybackHlsUrl = emptyState.externalPlaybackHlsUrl;
+    machineTube.externalPlaybackMagnetUrl = emptyState.externalPlaybackMagnetUrl;
     machineTube.externalThumbnailUrl = emptyState.externalThumbnailUrl;
     machineTube.sourceUrl = emptyState.sourceUrl;
     return;
@@ -1241,6 +1303,7 @@ function applyMachineTubePublishRecord(machineTube: RegisteredVideo["machineTube
   machineTube.durationSeconds = record.durationSeconds;
   machineTube.externalPlaybackUrl = record.externalPlaybackUrl;
   machineTube.externalPlaybackHlsUrl = record.externalPlaybackHlsUrl;
+  machineTube.externalPlaybackMagnetUrl = record.externalPlaybackMagnetUrl;
   machineTube.externalThumbnailUrl = record.externalThumbnailUrl;
   machineTube.sourceUrl = record.sourceUrl;
 }
@@ -1262,8 +1325,79 @@ function listPublishedMachineTubeRecords(video: RegisteredVideo): MachineTubePub
   return video.machineTube.publishHistory.filter((entry) => Boolean(entry.videoId));
 }
 
+function buildPeerDeliveryRuntimeSummary(): JsonRecord {
+  const snapshot = torrentManager.getEngineSnapshot();
+  const status =
+    snapshot.mode === "off"
+      ? "disabled"
+      : snapshot.degradedReason
+        ? "degraded"
+        : snapshot.runtimeChecked && snapshot.engine
+          ? "available"
+          : "pending";
+
+  return {
+    status,
+    mode: snapshot.mode,
+    enabled: snapshot.enabled,
+    runtimeChecked: snapshot.runtimeChecked,
+    engine: snapshot.engine,
+    browserPeerCompatible: snapshot.browserPeerCompatible,
+    hasBrowserCompatibleTrackers: snapshot.hasBrowserCompatibleTrackers,
+    activeSeedCount: snapshot.activeSeedCount,
+    maxActiveTorrents: snapshot.maxActiveTorrents,
+    maxConnections: snapshot.maxConnections,
+    trackerUrls: snapshot.trackerUrls,
+    degradedReason: snapshot.degradedReason,
+  };
+}
+
+function buildVideoPeerDeliverySummary(torrent: TorrentRuntimeSnapshot): JsonRecord {
+  const degradedReason = torrent.lastError ?? torrent.degradedReason ?? null;
+  let status: "disabled" | "pending" | "degraded" | "available" | "helping";
+
+  if (torrent.status === "disabled") {
+    status = "disabled";
+  } else if (degradedReason || !torrent.browserPeerCompatible) {
+    status = "degraded";
+  } else if (!torrent.magnetUrl) {
+    status = "pending";
+  } else if (torrent.peerCount > 0) {
+    status = "helping";
+  } else {
+    status = "available";
+  }
+
+  return {
+    status,
+    helping: status === "helping",
+    available: status === "available" || status === "helping",
+    engine: torrent.engine,
+    browserPeerCompatible: torrent.browserPeerCompatible,
+    degradedReason,
+    magnetUrl: torrent.magnetUrl,
+    infoHash: torrent.infoHash,
+    trackerUrls: torrent.trackerUrls,
+    peerCount: torrent.peerCount,
+    seededAt: torrent.seededAt,
+    seedUptimeSeconds: torrent.seedUptimeSeconds,
+    lastSeedAttemptAt: torrent.lastSeedAttemptAt,
+    lastSeedSuccessAt: torrent.lastSeedSuccessAt,
+    announceErrorCount: torrent.announceErrorCount,
+    lastAnnounceError: torrent.lastAnnounceError,
+  };
+}
+
 function toVideoResponse(video: RegisteredVideo, req: IncomingMessage): JsonRecord {
   const urls = resolveVideoOutputUrls(video, req);
+  const torrent = torrentManager.getSnapshot({
+    videoId: video.id,
+    displayName: video.fileName,
+    playbackUrl: urls.playbackUrl,
+    persisted: video.outputs.torrent,
+  });
+  const peerDelivery = buildVideoPeerDeliverySummary(torrent);
+  const hasTorrentState = Boolean(torrent.infoHash || torrent.lastError || torrent.seededAt);
   const playbackFormats: JsonRecord[] = [
     {
       format: "mp4",
@@ -1282,6 +1416,16 @@ function toVideoResponse(video: RegisteredVideo, req: IncomingMessage): JsonReco
     });
   }
 
+  if (torrent.magnetUrl) {
+    playbackFormats.push({
+      format: "torrent",
+      url: torrent.magnetUrl,
+      mimeType: "application/x-bittorrent;x-scheme-handler/magnet",
+      preferred: false,
+      peerCount: torrent.peerCount,
+    });
+  }
+
   return {
     id: video.id,
     filePath: video.filePath,
@@ -1292,6 +1436,10 @@ function toVideoResponse(video: RegisteredVideo, req: IncomingMessage): JsonReco
     playbackUrl: urls.playbackUrl,
     preferredPlaybackUrl: urls.preferredPlaybackUrl,
     hlsPlaybackUrl: urls.hlsPlaybackUrl,
+    torrentMagnetUrl: torrent.magnetUrl,
+    peerCount: torrent.peerCount,
+    peerDeliveryStatus: peerDelivery.status,
+    peerDelivery,
     thumbnailUrl: urls.thumbnailUrl,
     playbackFormats,
     metadata: {
@@ -1315,6 +1463,26 @@ function toVideoResponse(video: RegisteredVideo, req: IncomingMessage): JsonReco
             generatedAt: video.outputs.hls.generatedAt,
           }
         : null,
+      torrent:
+        hasTorrentState
+          ? {
+              status: torrent.status,
+              infoHash: torrent.infoHash,
+              magnetUrl: torrent.magnetUrl,
+              trackerUrls: torrent.trackerUrls,
+              peerCount: torrent.peerCount,
+              seededAt: torrent.seededAt,
+              seedUptimeSeconds: torrent.seedUptimeSeconds,
+              lastSeedAttemptAt: torrent.lastSeedAttemptAt,
+              lastSeedSuccessAt: torrent.lastSeedSuccessAt,
+              announceErrorCount: torrent.announceErrorCount,
+              lastAnnounceError: torrent.lastAnnounceError,
+              engine: torrent.engine,
+              browserPeerCompatible: torrent.browserPeerCompatible,
+              degradedReason: torrent.degradedReason,
+              lastError: torrent.lastError,
+            }
+          : null,
       lastPreparedAt: video.outputs.lastPreparedAt,
       lastPreparationError: video.outputs.lastPreparationError,
     },
@@ -1389,13 +1557,89 @@ async function ensureVideoOutputs(video: RegisteredVideo): Promise<void> {
     }
   }
 
+  const { torrent, issue: torrentIssue } = await ensureVideoTorrentOutput(video);
+  if (torrentIssue) {
+    issues.push(torrentIssue);
+  }
+
   video.outputs = {
     probe,
     thumbnail,
     hls,
+    torrent,
     lastPreparedAt: new Date().toISOString(),
     lastPreparationError: issues.length > 0 ? issues.join(" | ") : null,
   };
+}
+
+async function ensureVideoTorrentOutput(
+  video: RegisteredVideo,
+): Promise<{ torrent: PersistedTorrentOutput | null; issue: string | null }> {
+  let torrent = video.outputs.torrent;
+  const sourceFileStat = statSync(video.filePath);
+  const seededTorrent = await torrentManager.ensureSeed({
+    videoId: video.id,
+    filePath: video.filePath,
+    fileSignature: `${sourceFileStat.size}:${sourceFileStat.mtimeMs}`,
+    displayName: video.fileName,
+  });
+
+  if (seededTorrent?.infoHash) {
+    torrent = seededTorrent;
+  }
+
+  const torrentSnapshot = torrentManager.getSnapshot({
+    videoId: video.id,
+    displayName: video.fileName,
+    playbackUrl: null,
+    persisted: torrent,
+  });
+
+  if (!seededTorrent?.infoHash && torrentSnapshot.lastError) {
+    return {
+      torrent,
+      issue: `torrent seeding failed: ${torrentSnapshot.lastError}`,
+    };
+  }
+
+  return {
+    torrent,
+    issue: null,
+  };
+}
+
+async function restorePermanentPeerDeliverySeeds(): Promise<void> {
+  if (peerDeliveryMode !== "permanent") {
+    return;
+  }
+
+  let restored = 0;
+  let attempted = 0;
+
+  for (const video of videos) {
+    if (!shouldRestorePermanentPeerSeed(video)) {
+      continue;
+    }
+
+    attempted += 1;
+    const { torrent, issue } = await ensureVideoTorrentOutput(video);
+    if (torrent?.infoHash) {
+      video.outputs.torrent = torrent;
+      restored += 1;
+    }
+    if (issue) {
+      video.outputs.lastPreparationError = issue;
+    }
+  }
+
+  if (attempted > 0) {
+    persistVideos();
+    console.log(`[mt-node] peer delivery restored ${restored}/${attempted} published torrent seed(s).`);
+  }
+}
+
+function shouldRestorePermanentPeerSeed(video: RegisteredVideo): boolean {
+  return listPublishedMachineTubeRecords(video).length > 0 && existsSync(video.filePath);
 }
 
 function resolveThumbnailTimestamp(probe: VideoProbe | null): number {
@@ -1497,6 +1741,7 @@ async function publishExternalVideoToMachineTube(input: {
   credentials: MachineTubeCredentials;
   externalPlaybackUrl: string;
   externalPlaybackHlsUrl: string | null;
+  externalPlaybackMagnetUrl: string | null;
   externalThumbnailUrl: string | null;
   durationSeconds: number | null;
   title: string;
@@ -1517,6 +1762,7 @@ async function publishExternalVideoToMachineTube(input: {
       deliveryMode: "external",
       externalPlaybackUrl: input.externalPlaybackUrl,
       externalPlaybackHlsUrl: input.externalPlaybackHlsUrl,
+      externalPlaybackMagnetUrl: input.externalPlaybackMagnetUrl,
       externalThumbnailUrl: input.externalThumbnailUrl,
       durationSeconds: input.durationSeconds,
       title: input.title,
@@ -1557,6 +1803,7 @@ async function refreshExternalVideoOriginInMachineTube(input: {
   videoId: string;
   externalPlaybackUrl: string;
   externalPlaybackHlsUrl: string | null;
+  externalPlaybackMagnetUrl: string | null;
   externalThumbnailUrl: string | null;
   durationSeconds: number | null;
   sourceUrl: string | null;
@@ -1572,6 +1819,7 @@ async function refreshExternalVideoOriginInMachineTube(input: {
     body: JSON.stringify({
       externalPlaybackUrl: input.externalPlaybackUrl,
       externalPlaybackHlsUrl: input.externalPlaybackHlsUrl,
+      externalPlaybackMagnetUrl: input.externalPlaybackMagnetUrl,
       externalThumbnailUrl: input.externalThumbnailUrl,
       durationSeconds: input.durationSeconds,
       sourceUrl: input.sourceUrl,
@@ -1619,6 +1867,12 @@ async function syncPublishedVideoOrigins(): Promise<void> {
   for (const { video, publishRecord } of publishedTargets) {
     const nextPlaybackUrl = `${tunnel.publicBaseUrl}/media/${encodeURIComponent(video.id)}`;
     const nextPlaybackHlsUrl = video.outputs.hls ? `${tunnel.publicBaseUrl}/media/${encodeURIComponent(video.id)}/hls/index.m3u8` : null;
+    const nextPlaybackMagnetUrl = torrentManager.getSnapshot({
+      videoId: video.id,
+      displayName: video.fileName,
+      playbackUrl: nextPlaybackUrl,
+      persisted: video.outputs.torrent,
+    }).magnetUrl;
     const nextSourceUrl = `${tunnel.publicBaseUrl}/heartbeat`;
     const nextDurationSeconds = video.outputs.probe?.durationSeconds ?? null;
     const nextThumbnailUrl = video.outputs.thumbnail
@@ -1628,6 +1882,7 @@ async function syncPublishedVideoOrigins(): Promise<void> {
     if (
       publishRecord.externalPlaybackUrl === nextPlaybackUrl &&
       publishRecord.externalPlaybackHlsUrl === nextPlaybackHlsUrl &&
+      publishRecord.externalPlaybackMagnetUrl === nextPlaybackMagnetUrl &&
       publishRecord.externalThumbnailUrl === nextThumbnailUrl &&
       publishRecord.durationSeconds === nextDurationSeconds &&
       publishRecord.sourceUrl === nextSourceUrl
@@ -1654,12 +1909,14 @@ async function syncPublishedVideoOrigins(): Promise<void> {
         videoId: publishRecord.videoId,
         externalPlaybackUrl: nextPlaybackUrl,
         externalPlaybackHlsUrl: nextPlaybackHlsUrl,
+        externalPlaybackMagnetUrl: nextPlaybackMagnetUrl,
         externalThumbnailUrl: nextThumbnailUrl,
         durationSeconds: nextDurationSeconds,
         sourceUrl: nextSourceUrl,
       });
       publishRecord.externalPlaybackUrl = nextPlaybackUrl;
       publishRecord.externalPlaybackHlsUrl = nextPlaybackHlsUrl;
+      publishRecord.externalPlaybackMagnetUrl = nextPlaybackMagnetUrl;
       publishRecord.externalThumbnailUrl = nextThumbnailUrl;
       publishRecord.durationSeconds = nextDurationSeconds;
       publishRecord.sourceUrl = nextSourceUrl;
@@ -1852,6 +2109,7 @@ function normalizeRegisteredVideo(value: unknown): RegisteredVideo | null {
               generatedAt: normalizeOptionalString(hls?.generatedAt) ?? normalizeOptionalString(outputs?.lastPreparedAt) ?? createdAt,
             }
           : null,
+      torrent: normalizePersistedTorrentOutput(outputs?.torrent),
       lastPreparedAt: normalizeOptionalString(outputs?.lastPreparedAt),
       lastPreparationError: normalizeOptionalString(outputs?.lastPreparationError),
     },
@@ -1888,8 +2146,42 @@ function normalizeMachineTubePublishRecord(value: unknown): MachineTubePublishRe
         : null,
     externalPlaybackUrl: normalizeOptionalString(record.externalPlaybackUrl),
     externalPlaybackHlsUrl: normalizeOptionalString(record.externalPlaybackHlsUrl),
+    externalPlaybackMagnetUrl: normalizeOptionalString(record.externalPlaybackMagnetUrl),
     externalThumbnailUrl: normalizeOptionalString(record.externalThumbnailUrl),
     sourceUrl: normalizeOptionalString(record.sourceUrl),
+  };
+}
+
+function normalizePersistedTorrentOutput(value: unknown): PersistedTorrentOutput | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+
+  const record = value as JsonRecord;
+  const infoHash = normalizeOptionalString(record.infoHash);
+  const seededAt = normalizeOptionalString(record.seededAt);
+  const trackerUrls = Array.isArray(record.trackerUrls)
+    ? record.trackerUrls
+        .map((entry) => (typeof entry === "string" ? entry.trim() : ""))
+        .filter((entry): entry is string => entry.length > 0)
+    : [];
+
+  if (!infoHash || !seededAt) {
+    return null;
+  }
+
+  return {
+    infoHash,
+    trackerUrls,
+    seededAt,
+    lastError: normalizeOptionalString(record.lastError),
+    lastSeedAttemptAt: normalizeOptionalString(record.lastSeedAttemptAt),
+    lastSeedSuccessAt: normalizeOptionalString(record.lastSeedSuccessAt),
+    announceErrorCount:
+      typeof record.announceErrorCount === "number" && Number.isFinite(record.announceErrorCount) && record.announceErrorCount >= 0
+        ? Math.floor(record.announceErrorCount)
+        : 0,
+    lastAnnounceError: normalizeOptionalString(record.lastAnnounceError),
   };
 }
 
@@ -1977,6 +2269,7 @@ function buildHeartbeatPayload(req: IncomingMessage): JsonRecord {
     originHealthUrl,
     publicBaseUrl: tunnel.publicBaseUrl,
     tunnel,
+    peerDelivery: buildPeerDeliveryRuntimeSummary(),
     inbox: {
       availability: evaluateInboxAvailability(paths.inboxDir, runtimeEnvironment),
       availableFiles: listInboxFiles(),
@@ -1996,6 +2289,9 @@ function buildHeartbeatPayload(req: IncomingMessage): JsonRecord {
           machineTubeWatchUrl: publishRecord.watchUrl,
           playbackUrl: response.playbackUrl,
           hlsPlaybackUrl: response.hlsPlaybackUrl,
+          torrentMagnetUrl: response.torrentMagnetUrl ?? null,
+          peerCount: response.peerCount ?? 0,
+          peerDelivery: response.peerDelivery ?? null,
           thumbnailUrl: response.thumbnailUrl,
           title: publishRecord.title ?? video.fileName,
           lastPublishedAt: publishRecord.lastPublishedAt,
@@ -2014,6 +2310,7 @@ function buildOriginHealthPayload(req: IncomingMessage): JsonRecord {
     checkedAt,
     tunnelStatus: tunnel.status,
     publicBaseUrl: tunnel.publicBaseUrl,
+    peerDelivery: buildPeerDeliveryRuntimeSummary(),
     videos: videos.map((video) => {
       const response = toVideoResponse(video, req);
       const filePresent = existsSync(video.filePath);
@@ -2024,6 +2321,9 @@ function buildOriginHealthPayload(req: IncomingMessage): JsonRecord {
         machineTubeVideoId: video.machineTube.videoId,
         playbackUrl: response.playbackUrl,
         hlsPlaybackUrl: response.hlsPlaybackUrl,
+        torrentMagnetUrl: response.torrentMagnetUrl ?? null,
+        peerCount: response.peerCount ?? 0,
+        peerDelivery: response.peerDelivery ?? null,
         thumbnailUrl: response.thumbnailUrl,
         filePresent,
         originStatus: reachable ? "reachable" : "degraded",
@@ -2169,12 +2469,107 @@ function parseNumber(value: string | undefined, fallback: number): number {
   return fallback;
 }
 
+function parseOptionalPositiveNumber(value: string | undefined): number | null {
+  const parsed = Number.parseInt(value ?? "", 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+function handleCliCommand(args: string[], runtimePaths: RuntimePaths): boolean {
+  if (args.length === 0) {
+    return false;
+  }
+
+  if (args.length === 1 && (args[0] === "--help" || args[0] === "-h" || args[0] === "help")) {
+    printCliHelp(runtimePaths);
+    return true;
+  }
+
+  if (args[0] === "config" && args[1] === "init") {
+    const force = args.includes("--force");
+    const created = initEnvFile(runtimePaths.envFilePath, force);
+    console.log(`[mt-node] ${created ? "created" : "kept existing"} config file at ${runtimePaths.envFilePath}`);
+    console.log("[mt-node] edit MT_NODE_PEER_DELIVERY_MODE to switch between assist and permanent seeding.");
+    return true;
+  }
+
+  return false;
+}
+
+function printCliHelp(runtimePaths: RuntimePaths): void {
+  console.log("mt-node");
+  console.log("");
+  console.log("Commands:");
+  console.log("  mt-node                 Start the mt-node daemon");
+  console.log("  mt-node config init     Create a commented config.env file if it does not exist");
+  console.log("  mt-node config init --force");
+  console.log("                          Overwrite the existing config.env file");
+  console.log("");
+  console.log(`Default config env file: ${runtimePaths.envFilePath}`);
+}
+
+function initEnvFile(path: string, force: boolean): boolean {
+  if (existsSync(path) && !force) {
+    return false;
+  }
+
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, buildDefaultEnvFileContents(path));
+  return true;
+}
+
+function buildDefaultEnvFileContents(path: string): string {
+  return `# mt-node runtime configuration
+# This file is loaded automatically on startup.
+# Path: ${path}
+
+# Basic network config
+# MT_NODE_HOST=0.0.0.0
+# MT_NODE_PORT=43110
+
+# Creator inbox and public origin settings
+# MT_NODE_INBOX_DIR=
+# MT_NODE_PUBLIC_BASE_URL=
+# MT_NODE_TUNNEL_MODE=binary
+
+# MachineTube credentials for direct publishing
+# MT_MACHINETUBE_BASE_URL=
+# MT_MACHINETUBE_AGENT_ID=
+# MT_MACHINETUBE_API_KEY=
+
+# Peer delivery
+MT_NODE_PEER_DELIVERY_MODE=assist
+# Set to permanent if you want mt-node to restore published torrent seeds after restart.
+# MT_NODE_PEER_DELIVERY_MAX_ACTIVE_TORRENTS=
+# MT_NODE_PEER_DELIVERY_MAX_CONNECTIONS=
+# MT_NODE_WEBTORRENT_TRACKERS=
+
+# Legacy peer delivery toggle. Prefer MT_NODE_PEER_DELIVERY_MODE.
+# MT_NODE_WEBTORRENT_ENABLED=1
+`;
+}
+
 function parseTunnelMode(value: string | undefined): TunnelMode {
   const normalized = value?.trim().toLowerCase();
   if (normalized === "off" || normalized === "docker" || normalized === "binary") {
     return normalized;
   }
   return "binary";
+}
+
+function parsePeerDeliveryMode(
+  value: string | undefined,
+  legacyEnabled: string | undefined,
+): PeerDeliveryMode {
+  const normalized = value?.trim().toLowerCase();
+  if (normalized === "off" || normalized === "assist" || normalized === "permanent") {
+    return normalized;
+  }
+
+  if (legacyEnabled?.trim() === "0") {
+    return "off";
+  }
+
+  return "assist";
 }
 
 function defaultTunnelTargetUrl(mode: TunnelMode, localPort: number): string {
@@ -2309,6 +2704,40 @@ function safeReadText(path: string): string {
     return readFileSync(path, "utf8");
   } catch {
     return "";
+  }
+}
+
+function loadEnvFile(path: string): void {
+  const raw = safeReadText(path);
+  if (!raw) {
+    return;
+  }
+
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) {
+      continue;
+    }
+
+    const separatorIndex = trimmed.indexOf("=");
+    if (separatorIndex <= 0) {
+      continue;
+    }
+
+    const key = trimmed.slice(0, separatorIndex).trim();
+    if (!key || process.env[key] !== undefined) {
+      continue;
+    }
+
+    let value = trimmed.slice(separatorIndex + 1).trim();
+    if (
+      (value.startsWith("\"") && value.endsWith("\"")) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+
+    process.env[key] = value;
   }
 }
 
