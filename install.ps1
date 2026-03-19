@@ -80,8 +80,9 @@ try {
 
     # Move away from $InstallDir before removing it. Windows holds a handle on
     # the shell's CWD, which causes Remove-Item to fail if the terminal is
-    # sitting inside the install directory.
-    Set-Location $TmpDir
+    # sitting inside the install directory. Use $HOME rather than $TmpDir so
+    # the finally-block cleanup of $TmpDir doesn't hit the same problem.
+    Set-Location $HOME
 
     if (Test-Path $InstallDir) {
         Write-Host "Replacing mt-node install in $InstallDir"
