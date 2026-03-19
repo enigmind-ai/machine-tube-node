@@ -16,6 +16,10 @@ import { dirname, extname, resolve } from "node:path";
 import type { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { generateThumbnail, probeVideo, transcodeToHls, type MediaToolPaths, type VideoProbe } from "./media.js";
+import {
+  getHealthyTunnelSnapshot as resolveHealthyTunnelSnapshot,
+  probePublicTunnelHeartbeat,
+} from "./tunnel-health.js";
 
 type MachineTubeCredentials = {
   baseUrl: string;
@@ -441,6 +445,16 @@ class TunnelManager {
     } finally {
       this.pendingStart = null;
     }
+  }
+
+  async restart(reason: string): Promise<TunnelSnapshot> {
+    if (this.publicBaseUrlFromEnv || this.mode === "off") {
+      return this.getSnapshot();
+    }
+
+    console.warn(`[mt-node] cloudflared: restarting tunnel - ${reason}`);
+    this.stop();
+    return this.ensureStarted();
   }
 
   stop(): void {
@@ -1486,7 +1500,12 @@ async function syncPublishedVideoOrigins(): Promise<void> {
     return;
   }
 
-  const tunnel = await tunnelManager.ensureStarted();
+  const tunnel = await resolveHealthyTunnelSnapshot({
+    ensureStarted: () => tunnelManager.ensureStarted(),
+    restart: (reason) => tunnelManager.restart(reason),
+    probeHeartbeat: (url) => probePublicTunnelHeartbeat(url, { formatError }),
+    logWarn: (message) => console.warn(message),
+  });
   if (!tunnel.publicBaseUrl) {
     console.warn(`[mt-node] sync: skipping — tunnel not online (status=${tunnel.status}${tunnel.lastError ? `, error: ${tunnel.lastError}` : ""})`);
     return;
