@@ -3,7 +3,6 @@
 param()
 $ErrorActionPreference = "Stop"
 
-$RepoUrl   = "https://github.com/enigmind-ai/machine-tube-node.git"
 $Branch    = if ($env:MT_NODE_BRANCH)       { $env:MT_NODE_BRANCH }       else { "main" }
 $InstallDir = if ($env:MT_NODE_INSTALL_DIR) { $env:MT_NODE_INSTALL_DIR }  else { Join-Path $HOME ".machine-tube\mt-node" }
 $BinDir    = if ($env:MT_NODE_BIN_DIR)      { $env:MT_NODE_BIN_DIR }      else { Join-Path $HOME ".local\bin" }
@@ -30,28 +29,66 @@ New-Item -ItemType Directory -Force -Path $BinDir    | Out-Null
 New-Item -ItemType Directory -Force -Path $InboxDir  | Out-Null
 New-Item -ItemType Directory -Force -Path (Split-Path $InstallDir -Parent) | Out-Null
 
-if (Get-Command git -ErrorAction SilentlyContinue) {
-    if (Test-Path (Join-Path $InstallDir ".git")) {
-        Write-Host "Updating mt-node in $InstallDir"
-        git -C $InstallDir fetch --depth 1 origin $Branch
-        git -C $InstallDir checkout $Branch
-        git -C $InstallDir reset --hard "origin/$Branch"
-    } else {
-        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $InstallDir
-        Write-Host "Cloning mt-node into $InstallDir"
-        git clone --depth 1 --branch $Branch $RepoUrl $InstallDir
+function Preserve-RuntimeState {
+    param(
+        [string]$InstallDir,
+        [string]$ConfigEnvPath,
+        [string]$PreserveDir
+    )
+
+    if (Test-Path $ConfigEnvPath) {
+        Move-Item $ConfigEnvPath (Join-Path $PreserveDir "config.env")
     }
-} else {
-    $TmpDir = Join-Path $env:TEMP "mt-node-install-$(Get-Random)"
-    New-Item -ItemType Directory -Force -Path $TmpDir | Out-Null
+
+    $DataDir = Join-Path $InstallDir "data"
+    if (Test-Path $DataDir) {
+        Move-Item $DataDir (Join-Path $PreserveDir "data")
+    }
+}
+
+function Restore-RuntimeState {
+    param(
+        [string]$InstallDir,
+        [string]$ConfigEnvPath,
+        [string]$PreserveDir
+    )
+
+    $PreservedConfig = Join-Path $PreserveDir "config.env"
+    if (Test-Path $PreservedConfig) {
+        Move-Item $PreservedConfig $ConfigEnvPath
+    }
+
+    $PreservedData = Join-Path $PreserveDir "data"
+    if (Test-Path $PreservedData) {
+        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue (Join-Path $InstallDir "data")
+        Move-Item $PreservedData (Join-Path $InstallDir "data")
+    }
+}
+
+$TmpDir = Join-Path $env:TEMP "mt-node-install-$(Get-Random)"
+New-Item -ItemType Directory -Force -Path $TmpDir | Out-Null
+try {
     $ArchivePath = Join-Path $TmpDir "mt-node.zip"
     $ExtractDir  = Join-Path $TmpDir "extract"
     Write-Host "Downloading mt-node source archive"
     Invoke-WebRequest -Uri "https://github.com/enigmind-ai/machine-tube-node/archive/refs/heads/$Branch.zip" -OutFile $ArchivePath
     New-Item -ItemType Directory -Force -Path $ExtractDir | Out-Null
     Expand-Archive -Path $ArchivePath -DestinationPath $ExtractDir -Force
-    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $InstallDir
+
+    $PreserveDir = Join-Path $TmpDir "preserve"
+    New-Item -ItemType Directory -Force -Path $PreserveDir | Out-Null
+
+    if (Test-Path $InstallDir) {
+        Write-Host "Replacing mt-node install in $InstallDir"
+        Preserve-RuntimeState -InstallDir $InstallDir -ConfigEnvPath $ConfigEnvPath -PreserveDir $PreserveDir
+        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $InstallDir
+    } else {
+        Write-Host "Installing mt-node into $InstallDir"
+    }
+
     Move-Item (Join-Path $ExtractDir "machine-tube-node-$Branch") $InstallDir
+    Restore-RuntimeState -InstallDir $InstallDir -ConfigEnvPath $ConfigEnvPath -PreserveDir $PreserveDir
+} finally {
     Remove-Item -Recurse -Force $TmpDir
 }
 
