@@ -179,6 +179,29 @@ type GeneratedHlsOutput = {
   generatedAt: string;
 };
 
+type OriginTrafficAssetKind = "raw" | "hls-playlist" | "hls-segment" | "thumbnail";
+
+type VideoOriginTrafficCounters = {
+  totalRequests: number;
+  totalBytes: number;
+  headRequests: number;
+  rangeRequests: number;
+  fullRequests: number;
+  rawRequests: number;
+  rawBytes: number;
+  hlsPlaylistRequests: number;
+  hlsPlaylistBytes: number;
+  hlsSegmentRequests: number;
+  hlsSegmentBytes: number;
+  thumbnailRequests: number;
+  thumbnailBytes: number;
+  lastRequestAt: string | null;
+  lastMethod: string | null;
+  lastStatusCode: number | null;
+  lastAssetKind: OriginTrafficAssetKind | null;
+  lastPath: string | null;
+};
+
 type MachineTubePublishResult = {
   ok: true;
   videoId: string;
@@ -670,6 +693,7 @@ const config = loadOrCreateConfig(paths.configPath, {
   createdAt: startedAt.toISOString(),
 });
 const videos = loadOrCreateVideos(paths.videosPath);
+const originTrafficCounters = new Map<string, VideoOriginTrafficCounters>();
 const tunnelManager = new TunnelManager(port, paths.managedCloudflaredPath);
 const mediaToolsManager = new MediaToolsManager(paths.binDir);
 const peerDeliveryMode = parsePeerDeliveryMode(
@@ -725,6 +749,7 @@ const server = http.createServer(async (req, res) => {
         tunnel: tunnelManager.getSnapshot(),
         mediaTools: mediaToolsManager.getSnapshot(),
         peerDelivery: buildPeerDeliveryRuntimeSummary(),
+        originTraffic: buildOriginTrafficDiagnostics(),
         inbox: {
           availability: evaluateInboxAvailability(paths.inboxDir, runtimeEnvironment),
           files: listInboxFiles(),
@@ -747,12 +772,32 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    if (req.method === "GET" && url.pathname === "/diagnostics/origin-traffic") {
+      const videoId = normalizeOptionalString(url.searchParams.get("videoId"));
+      return sendJson(res, 200, {
+        ok: true,
+        originTraffic: buildOriginTrafficDiagnostics(videoId),
+      });
+    }
+
+    if (req.method === "POST" && url.pathname === "/diagnostics/origin-traffic/reset") {
+      const videoId = normalizeOptionalString(url.searchParams.get("videoId"));
+      return sendJson(res, 200, {
+        ok: true,
+        ...resetOriginTrafficCounters(videoId),
+        originTraffic: buildOriginTrafficDiagnostics(videoId),
+      });
+    }
+
     if (req.method === "GET" && url.pathname === "/tunnel/status") {
       return sendJson(res, 200, { ok: true, tunnel: tunnelManager.getSnapshot() });
     }
 
     if (req.method === "POST" && url.pathname === "/tunnel/start") {
       const tunnel = await tunnelManager.ensureStarted();
+      void reseedRegisteredVideosPeerDeliveryTorrents().catch((error) => {
+        console.error(`[mt-node] peer delivery reseed after tunnel/start failed: ${formatError(error)}`);
+      });
       return sendJson(res, 200, { ok: true, tunnel });
     }
 
@@ -795,7 +840,12 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, result.status, { ok: false, error: result.error, ...(result.details ?? {}) });
       }
 
-      await tunnelManager.ensureStarted().catch(() => undefined);
+      // After the new video is in `videos`, so a concurrent tunnel-up reseed cannot miss it.
+      void tunnelManager
+        .ensureStarted()
+        .then(() => reseedRegisteredVideosPeerDeliveryTorrents())
+        .catch(() => undefined);
+
       return sendJson(res, result.created ? 201 : 200, {
         ok: true,
         selection: selection.selection,
@@ -819,6 +869,22 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, selection.status, { ok: false, error: selection.error, ...(selection.details ?? {}) });
       }
 
+      // Validate MachineTube-specific fields before doing any expensive work.
+      const publishTitle = typeof body.title === "string" ? body.title.trim() : "";
+      const credentialsResult = resolveMachineTubeCredentials(body.machineTube, config.machineTube);
+      if (body.publishToMachineTube !== false) {
+        if (!publishTitle) {
+          return sendJson(res, 400, { ok: false, error: "title is required when publishing to MachineTube." });
+        }
+        if (!credentialsResult.ok) {
+          console.warn(`[mt-node] publish: rejected — MachineTube credentials missing. Pass machineTube: { baseUrl, agentId, apiKey } in the request body, or set publishToMachineTube=false to skip.`);
+          return sendJson(res, 400, {
+            ok: false,
+            error: "MachineTube credentials are required. Include machineTube: { baseUrl, agentId, apiKey } in the request body, or set publishToMachineTube: false to skip the MachineTube publish step.",
+          });
+        }
+      }
+
       const registerResult = await ensureRegisteredVideo(selection.filePath);
       if (!registerResult.ok) {
         console.warn(`[mt-node] publish: file error — ${registerResult.error}`);
@@ -833,6 +899,11 @@ const server = http.createServer(async (req, res) => {
       }
 
       const video = registerResult.video;
+      const outputsBeforeTunnel = JSON.stringify(video.outputs);
+      await ensureVideoOutputs(video);
+      if (JSON.stringify(video.outputs) !== outputsBeforeTunnel) {
+        persistVideos();
+      }
       const videoResponse = toVideoResponse(video, req);
       const externalPlaybackUrl = String(videoResponse.playbackUrl);
       const externalPlaybackHlsUrl =
@@ -860,29 +931,15 @@ const server = http.createServer(async (req, res) => {
         });
       }
 
-      const title = typeof body.title === "string" ? body.title.trim() : "";
-      if (!title) {
-        return sendJson(res, 400, { ok: false, error: "title is required when publishing to MachineTube." });
-      }
-
-      // Credentials are required — body takes priority, config is the fallback.
-      const credentialsResult = resolveMachineTubeCredentials(body.machineTube, config.machineTube);
-      if (!credentialsResult.ok) {
-        console.warn(`[mt-node] publish: rejected — MachineTube credentials missing. Pass machineTube: { baseUrl, agentId, apiKey } in the request body, or set publishToMachineTube=false to skip.`);
-        return sendJson(res, 400, {
-          ok: false,
-          error: "MachineTube credentials are required. Include machineTube: { baseUrl, agentId, apiKey } in the request body, or set publishToMachineTube: false to skip the MachineTube publish step.",
-        });
-      }
-
+      const resolvedCredentials = (credentialsResult as { ok: true; credentials: MachineTubeCredentials }).credentials;
       const publishResult = await publishExternalVideoToMachineTube({
-        credentials: credentialsResult.credentials,
+        credentials: resolvedCredentials,
         externalPlaybackUrl,
         externalPlaybackHlsUrl,
         externalPlaybackMagnetUrl,
         externalThumbnailUrl,
         durationSeconds,
-        title,
+        title: publishTitle,
         description: typeof body.description === "string" ? body.description.trim() : "",
         tags: normalizeTags(body.tags),
         sourceUrl: normalizeOptionalString(body.sourceUrl) ?? `${tunnel.publicBaseUrl}/heartbeat`,
@@ -892,9 +949,9 @@ const server = http.createServer(async (req, res) => {
       // If the config didn't have credentials (they came from the request body),
       // save them now so the background sync loop can refresh URLs automatically.
       if (!hasCompleteMachineTubeCredentials(config.machineTube)) {
-        config.machineTube = credentialsResult.credentials;
+        config.machineTube = resolvedCredentials;
         persistConfig();
-        console.log(`[mt-node] credentials saved to config from publish request (agentId=${credentialsResult.credentials.agentId})`);
+        console.log(`[mt-node] credentials saved to config from publish request (agentId=${resolvedCredentials.agentId})`);
       }
 
       upsertMachineTubePublishRecord(video.machineTube, createMachineTubePublishRecord({
@@ -904,7 +961,7 @@ const server = http.createServer(async (req, res) => {
         videoId: String(publishResult.videoId),
         watchUrl: publishResult.watchUrl,
         status: publishResult.status,
-        title,
+        title: publishTitle,
         durationSeconds,
         externalPlaybackUrl,
         externalPlaybackHlsUrl,
@@ -935,6 +992,44 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    if ((req.method === "GET" || req.method === "HEAD") && url.pathname.startsWith("/videos/") && url.pathname.endsWith("/torrent")) {
+      const videoId = decodeURIComponent(url.pathname.slice("/videos/".length, -"/torrent".length));
+      const video = videos.find((item) => item.id === videoId);
+      if (!video) {
+        return sendJson(res, 404, { ok: false, error: "Video not found.", videoId });
+      }
+      const urls = resolveVideoOutputUrls(video, req);
+      const tunnelSnapshot = tunnelManager.getSnapshot();
+      const torrentSnapshot = torrentManager.getSnapshot({
+        videoId: video.id,
+        displayName: video.fileName,
+        playbackUrl: urls.playbackUrl,
+        torrentFileUrl: urls.torrentFileUrl,
+        persisted: video.outputs.torrent,
+        trustPlaybackUrlForTrackerOnlyTorrentFile: trustPlaybackHostForTrackerOnlyTorrent(req, tunnelSnapshot),
+      });
+      if (!torrentSnapshot.torrentFileUrl) {
+        return sendJson(res, 404, {
+          ok: false,
+          error:
+            "Torrent file is not available for this playback URL. It may still be seeding, or peer delivery may be reseeding after an origin URL change.",
+          videoId,
+        });
+      }
+      const torrentFile = torrentManager.getTorrentFile(videoId);
+      if (!torrentFile) {
+        return sendJson(res, 404, { ok: false, error: "Torrent file not available. Video may still be seeding.", videoId });
+      }
+      res.writeHead(200, {
+        "Content-Type": "application/x-bittorrent",
+        "Content-Length": String(torrentFile.length),
+        "Access-Control-Allow-Origin": "*",
+        "Cache-Control": "no-store",
+      });
+      res.end(req.method === "HEAD" ? undefined : torrentFile);
+      return;
+    }
+
     if (req.method === "GET" && url.pathname.startsWith("/videos/")) {
       const videoId = decodeURIComponent(url.pathname.slice("/videos/".length));
       const video = videos.find((item) => item.id === videoId);
@@ -944,7 +1039,18 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { ok: true, video: toVideoResponse(video, req) });
     }
 
-    if ((req.method === "GET" || req.method === "HEAD") && url.pathname.startsWith("/media/")) {
+    if ((req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS") && url.pathname.startsWith("/media/")) {
+      if (req.method === "OPTIONS") {
+        res.writeHead(204, {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+          "Access-Control-Allow-Headers": "*",
+          "Access-Control-Max-Age": "86400",
+        });
+        res.end();
+        return;
+      }
+
       const resolvedMedia = resolveMediaRequest(url.pathname);
       if (!resolvedMedia) {
         return sendJson(res, 404, {
@@ -969,7 +1075,17 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 404, { ok: false, error: "Media output not found.", videoId: resolvedMedia.videoId });
       }
 
-      return serveStaticAsset(req, res, asset);
+      return serveStaticAsset(
+        req,
+        res,
+        video.id,
+        asset,
+        resolvedMedia.kind === "thumbnail"
+          ? "thumbnail"
+          : asset.mimeType === "application/vnd.apple.mpegurl"
+            ? "hls-playlist"
+            : "hls-segment",
+      );
     }
 
     return sendJson(res, 404, {
@@ -995,8 +1111,15 @@ server.listen(port, host, () => {
   console.log(`[mt-node] peer delivery mode: ${peerDeliveryMode}`);
   console.log(`[mt-node] videos loaded: ${videos.length} (${countPublishedMachineTubeVideos()} published to MachineTube)`);
   if (tunnelSnapshot.mode !== "off") {
-    void tunnelManager.ensureStarted().catch((error) => {
-      console.error(`[mt-node] tunnel start failed: ${formatError(error)}`);
+    void tunnelManager
+      .ensureStarted()
+      .then(() => reseedRegisteredVideosPeerDeliveryTorrents())
+      .catch((error) => {
+        console.error(`[mt-node] tunnel start failed: ${formatError(error)}`);
+      });
+  } else if (tunnelSnapshot.publicBaseUrl) {
+    void reseedRegisteredVideosPeerDeliveryTorrents().catch((error) => {
+      console.error(`[mt-node] initial peer delivery reseed failed: ${formatError(error)}`);
     });
   }
   void mediaToolsManager.bootstrapManaged().catch((error) => {
@@ -1376,6 +1499,7 @@ function buildVideoPeerDeliverySummary(torrent: TorrentRuntimeSnapshot): JsonRec
     browserPeerCompatible: torrent.browserPeerCompatible,
     degradedReason,
     magnetUrl: torrent.magnetUrl,
+    torrentFileUrl: torrent.torrentFileUrl,
     infoHash: torrent.infoHash,
     trackerUrls: torrent.trackerUrls,
     peerCount: torrent.peerCount,
@@ -1388,13 +1512,184 @@ function buildVideoPeerDeliverySummary(torrent: TorrentRuntimeSnapshot): JsonRec
   };
 }
 
+function createEmptyOriginTrafficCounters(): VideoOriginTrafficCounters {
+  return {
+    totalRequests: 0,
+    totalBytes: 0,
+    headRequests: 0,
+    rangeRequests: 0,
+    fullRequests: 0,
+    rawRequests: 0,
+    rawBytes: 0,
+    hlsPlaylistRequests: 0,
+    hlsPlaylistBytes: 0,
+    hlsSegmentRequests: 0,
+    hlsSegmentBytes: 0,
+    thumbnailRequests: 0,
+    thumbnailBytes: 0,
+    lastRequestAt: null,
+    lastMethod: null,
+    lastStatusCode: null,
+    lastAssetKind: null,
+    lastPath: null,
+  };
+}
+
+function getVideoOriginTrafficCounters(videoId: string): VideoOriginTrafficCounters {
+  return originTrafficCounters.get(videoId) ?? createEmptyOriginTrafficCounters();
+}
+
+function buildVideoOriginTrafficSnapshot(videoId: string): JsonRecord {
+  const counters = getVideoOriginTrafficCounters(videoId);
+  return {
+    totalRequests: counters.totalRequests,
+    totalBytes: counters.totalBytes,
+    headRequests: counters.headRequests,
+    rangeRequests: counters.rangeRequests,
+    fullRequests: counters.fullRequests,
+    rawRequests: counters.rawRequests,
+    rawBytes: counters.rawBytes,
+    hlsPlaylistRequests: counters.hlsPlaylistRequests,
+    hlsPlaylistBytes: counters.hlsPlaylistBytes,
+    hlsSegmentRequests: counters.hlsSegmentRequests,
+    hlsSegmentBytes: counters.hlsSegmentBytes,
+    thumbnailRequests: counters.thumbnailRequests,
+    thumbnailBytes: counters.thumbnailBytes,
+    lastRequestAt: counters.lastRequestAt,
+    lastMethod: counters.lastMethod,
+    lastStatusCode: counters.lastStatusCode,
+    lastAssetKind: counters.lastAssetKind,
+    lastPath: counters.lastPath,
+  };
+}
+
+function recordOriginTraffic(input: {
+  videoId: string;
+  assetKind: OriginTrafficAssetKind;
+  method: string;
+  requestPath: string;
+  statusCode: number;
+  bytesServed: number;
+  rangeRequest: boolean;
+}): void {
+  const counters = {
+    ...getVideoOriginTrafficCounters(input.videoId),
+  };
+
+  counters.totalRequests += 1;
+  counters.totalBytes += input.bytesServed;
+  counters.lastRequestAt = new Date().toISOString();
+  counters.lastMethod = input.method;
+  counters.lastStatusCode = input.statusCode;
+  counters.lastAssetKind = input.assetKind;
+  counters.lastPath = input.requestPath;
+
+  if (input.method === "HEAD") {
+    counters.headRequests += 1;
+  } else if (input.rangeRequest) {
+    counters.rangeRequests += 1;
+  } else {
+    counters.fullRequests += 1;
+  }
+
+  switch (input.assetKind) {
+    case "raw":
+      counters.rawRequests += 1;
+      counters.rawBytes += input.bytesServed;
+      break;
+    case "hls-playlist":
+      counters.hlsPlaylistRequests += 1;
+      counters.hlsPlaylistBytes += input.bytesServed;
+      break;
+    case "hls-segment":
+      counters.hlsSegmentRequests += 1;
+      counters.hlsSegmentBytes += input.bytesServed;
+      break;
+    case "thumbnail":
+      counters.thumbnailRequests += 1;
+      counters.thumbnailBytes += input.bytesServed;
+      break;
+  }
+
+  originTrafficCounters.set(input.videoId, counters);
+}
+
+function buildOriginTrafficDiagnostics(filterVideoId?: string | null): JsonRecord {
+  const matchingVideos = videos.filter((video) => !filterVideoId || video.id === filterVideoId);
+  const snapshots = matchingVideos.map((video) => ({
+    localVideoId: video.id,
+    machineTubeVideoId: video.machineTube.videoId,
+    fileName: video.fileName,
+    counters: buildVideoOriginTrafficSnapshot(video.id),
+  }));
+  const totals = snapshots.reduce((aggregate, entry) => {
+    const counters = entry.counters as VideoOriginTrafficCounters;
+    aggregate.totalRequests += counters.totalRequests;
+    aggregate.totalBytes += counters.totalBytes;
+    aggregate.headRequests += counters.headRequests;
+    aggregate.rangeRequests += counters.rangeRequests;
+    aggregate.fullRequests += counters.fullRequests;
+    aggregate.rawRequests += counters.rawRequests;
+    aggregate.rawBytes += counters.rawBytes;
+    aggregate.hlsPlaylistRequests += counters.hlsPlaylistRequests;
+    aggregate.hlsPlaylistBytes += counters.hlsPlaylistBytes;
+    aggregate.hlsSegmentRequests += counters.hlsSegmentRequests;
+    aggregate.hlsSegmentBytes += counters.hlsSegmentBytes;
+    aggregate.thumbnailRequests += counters.thumbnailRequests;
+    aggregate.thumbnailBytes += counters.thumbnailBytes;
+    return aggregate;
+  }, createEmptyOriginTrafficCounters());
+
+  return {
+    recordedVideoCount: originTrafficCounters.size,
+    matchingVideoCount: snapshots.length,
+    totals: {
+      totalRequests: totals.totalRequests,
+      totalBytes: totals.totalBytes,
+      headRequests: totals.headRequests,
+      rangeRequests: totals.rangeRequests,
+      fullRequests: totals.fullRequests,
+      rawRequests: totals.rawRequests,
+      rawBytes: totals.rawBytes,
+      hlsPlaylistRequests: totals.hlsPlaylistRequests,
+      hlsPlaylistBytes: totals.hlsPlaylistBytes,
+      hlsSegmentRequests: totals.hlsSegmentRequests,
+      hlsSegmentBytes: totals.hlsSegmentBytes,
+      thumbnailRequests: totals.thumbnailRequests,
+      thumbnailBytes: totals.thumbnailBytes,
+    },
+    videos: snapshots,
+  };
+}
+
+function resetOriginTrafficCounters(videoId?: string | null): JsonRecord {
+  if (videoId) {
+    const existed = originTrafficCounters.delete(videoId);
+    return {
+      resetAll: false,
+      videoId,
+      reset: existed ? 1 : 0,
+    };
+  }
+
+  const reset = originTrafficCounters.size;
+  originTrafficCounters.clear();
+  return {
+    resetAll: true,
+    reset,
+  };
+}
+
 function toVideoResponse(video: RegisteredVideo, req: IncomingMessage): JsonRecord {
   const urls = resolveVideoOutputUrls(video, req);
+  const tunnelSnapshot = tunnelManager.getSnapshot();
   const torrent = torrentManager.getSnapshot({
     videoId: video.id,
     displayName: video.fileName,
     playbackUrl: urls.playbackUrl,
+    torrentFileUrl: urls.torrentFileUrl,
     persisted: video.outputs.torrent,
+    trustPlaybackUrlForTrackerOnlyTorrentFile: trustPlaybackHostForTrackerOnlyTorrent(req, tunnelSnapshot),
   });
   const peerDelivery = buildVideoPeerDeliverySummary(torrent);
   const hasTorrentState = Boolean(torrent.infoHash || torrent.lastError || torrent.seededAt);
@@ -1440,6 +1735,7 @@ function toVideoResponse(video: RegisteredVideo, req: IncomingMessage): JsonReco
     peerCount: torrent.peerCount,
     peerDeliveryStatus: peerDelivery.status,
     peerDelivery,
+    originTraffic: buildVideoOriginTrafficSnapshot(video.id),
     thumbnailUrl: urls.thumbnailUrl,
     playbackFormats,
     metadata: {
@@ -1577,11 +1873,17 @@ async function ensureVideoTorrentOutput(
 ): Promise<{ torrent: PersistedTorrentOutput | null; issue: string | null }> {
   let torrent = video.outputs.torrent;
   const sourceFileStat = statSync(video.filePath);
+  const playbackPath = `/media/${encodeURIComponent(video.id)}`;
+  const tunnelSnapshot = tunnelManager.getSnapshot();
+  const playbackUrl = tunnelSnapshot.publicBaseUrl
+    ? `${tunnelSnapshot.publicBaseUrl}${playbackPath}`
+    : null;
   const seededTorrent = await torrentManager.ensureSeed({
     videoId: video.id,
     filePath: video.filePath,
     fileSignature: `${sourceFileStat.size}:${sourceFileStat.mtimeMs}`,
     displayName: video.fileName,
+    playbackUrl,
   });
 
   if (seededTorrent?.infoHash) {
@@ -1592,6 +1894,7 @@ async function ensureVideoTorrentOutput(
     videoId: video.id,
     displayName: video.fileName,
     playbackUrl: null,
+    torrentFileUrl: null,
     persisted: torrent,
   });
 
@@ -1608,10 +1911,43 @@ async function ensureVideoTorrentOutput(
   };
 }
 
+async function reseedRegisteredVideosPeerDeliveryTorrents(): Promise<void> {
+  if (peerDeliveryMode === "off") {
+    return;
+  }
+  const tunnel = tunnelManager.getSnapshot();
+  if (!tunnel.publicBaseUrl) {
+    return;
+  }
+
+  let changed = false;
+  for (const video of videos) {
+    if (!existsSync(video.filePath)) {
+      continue;
+    }
+    const prevTorrentJson = JSON.stringify(video.outputs.torrent);
+    const { torrent } = await ensureVideoTorrentOutput(video);
+    if (JSON.stringify(torrent) !== prevTorrentJson) {
+      video.outputs.torrent = torrent;
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    persistVideos();
+  }
+}
+
 async function restorePermanentPeerDeliverySeeds(): Promise<void> {
   if (peerDeliveryMode !== "permanent") {
     return;
   }
+
+  // Seed restoration does not depend on the tunnel: ensureVideoTorrentOutput()
+  // reads the tunnel snapshot itself and passes playbackUrl=null when it is
+  // unavailable, so tracker-based seeding still starts. The sync loop will
+  // inject the web-seed URL once the tunnel comes up.
+  void tunnelManager.ensureStarted().catch(() => undefined);
 
   let restored = 0;
   let attempted = 0;
@@ -1653,10 +1989,11 @@ function resolveThumbnailTimestamp(probe: VideoProbe | null): number {
 function resolveVideoOutputUrls(
   video: RegisteredVideo,
   req: IncomingMessage,
-): { playbackUrl: string; preferredPlaybackUrl: string; hlsPlaybackUrl: string | null; thumbnailUrl: string | null } {
+): { playbackUrl: string; preferredPlaybackUrl: string; hlsPlaybackUrl: string | null; thumbnailUrl: string | null; torrentFileUrl: string } {
   const playbackPath = `/media/${encodeURIComponent(video.id)}`;
   const hlsPath = video.outputs.hls ? `/media/${encodeURIComponent(video.id)}/hls/index.m3u8` : null;
   const thumbnailPath = video.outputs.thumbnail ? `/media/${encodeURIComponent(video.id)}/thumbnail.jpg` : null;
+  const torrentPath = `/videos/${encodeURIComponent(video.id)}/torrent`;
   const tunnel = tunnelManager.getSnapshot();
 
   const playbackUrl = tunnel.publicBaseUrl ? `${tunnel.publicBaseUrl}${playbackPath}` : buildLocalUrl(req, playbackPath);
@@ -1666,12 +2003,16 @@ function resolveVideoOutputUrls(
       ? `${tunnel.publicBaseUrl}${thumbnailPath}`
       : buildLocalUrl(req, thumbnailPath)
     : null;
+  const torrentFileUrl = tunnel.publicBaseUrl
+    ? `${tunnel.publicBaseUrl}${torrentPath}`
+    : buildLocalUrl(req, torrentPath);
 
   return {
     playbackUrl,
     preferredPlaybackUrl: hlsPlaybackUrl ?? playbackUrl,
     hlsPlaybackUrl,
     thumbnailUrl,
+    torrentFileUrl,
   };
 }
 
@@ -1717,6 +2058,7 @@ function findHlsFile(video: RegisteredVideo, relativePath: string): GeneratedHls
 }
 
 async function prepareRegisteredVideos(): Promise<void> {
+  void tunnelManager.ensureStarted().catch(() => undefined);
   let changed = false;
 
   for (const video of videos) {
@@ -1730,6 +2072,24 @@ async function prepareRegisteredVideos(): Promise<void> {
   if (changed) {
     persistVideos();
   }
+}
+
+function isHttpRequestFromLoopback(req: IncomingMessage): boolean {
+  const raw = req.socket?.remoteAddress;
+  if (!raw) {
+    return false;
+  }
+  if (raw === "127.0.0.1" || raw === "::1") {
+    return true;
+  }
+  if (raw.startsWith("::ffff:")) {
+    return raw.slice("::ffff:".length) === "127.0.0.1";
+  }
+  return false;
+}
+
+function trustPlaybackHostForTrackerOnlyTorrent(req: IncomingMessage, tunnel: TunnelSnapshot): boolean {
+  return Boolean(tunnel.publicBaseUrl) || isHttpRequestFromLoopback(req);
 }
 
 function buildLocalUrl(req: IncomingMessage, path: string): string {
@@ -1867,11 +2227,33 @@ async function syncPublishedVideoOrigins(): Promise<void> {
   for (const { video, publishRecord } of publishedTargets) {
     const nextPlaybackUrl = `${tunnel.publicBaseUrl}/media/${encodeURIComponent(video.id)}`;
     const nextPlaybackHlsUrl = video.outputs.hls ? `${tunnel.publicBaseUrl}/media/${encodeURIComponent(video.id)}/hls/index.m3u8` : null;
+    const publicOriginRotated = publishRecord.externalPlaybackUrl !== nextPlaybackUrl;
+    const shouldReseedPeerDeliveryOnSync =
+      peerDeliveryMode !== "off" &&
+      existsSync(video.filePath) &&
+      (peerDeliveryMode === "permanent" || (peerDeliveryMode === "assist" && publicOriginRotated));
+
+    if (shouldReseedPeerDeliveryOnSync) {
+      const sourceFileStat = statSync(video.filePath);
+      const seededTorrent = await torrentManager.ensureSeed({
+        videoId: video.id,
+        filePath: video.filePath,
+        fileSignature: `${sourceFileStat.size}:${sourceFileStat.mtimeMs}`,
+        displayName: video.fileName,
+        playbackUrl: nextPlaybackUrl,
+      });
+      if (seededTorrent && JSON.stringify(seededTorrent) !== JSON.stringify(video.outputs.torrent)) {
+        video.outputs.torrent = seededTorrent;
+        changed = true;
+      }
+    }
     const nextPlaybackMagnetUrl = torrentManager.getSnapshot({
       videoId: video.id,
       displayName: video.fileName,
       playbackUrl: nextPlaybackUrl,
+      torrentFileUrl: `${tunnel.publicBaseUrl}/videos/${encodeURIComponent(video.id)}/torrent`,
       persisted: video.outputs.torrent,
+      trustPlaybackUrlForTrackerOnlyTorrentFile: true,
     }).magnetUrl;
     const nextSourceUrl = `${tunnel.publicBaseUrl}/heartbeat`;
     const nextDurationSeconds = video.outputs.probe?.durationSeconds ?? null;
@@ -2292,6 +2674,7 @@ function buildHeartbeatPayload(req: IncomingMessage): JsonRecord {
           torrentMagnetUrl: response.torrentMagnetUrl ?? null,
           peerCount: response.peerCount ?? 0,
           peerDelivery: response.peerDelivery ?? null,
+          originTraffic: response.originTraffic ?? null,
           thumbnailUrl: response.thumbnailUrl,
           title: publishRecord.title ?? video.fileName,
           lastPublishedAt: publishRecord.lastPublishedAt,
@@ -2324,6 +2707,7 @@ function buildOriginHealthPayload(req: IncomingMessage): JsonRecord {
         torrentMagnetUrl: response.torrentMagnetUrl ?? null,
         peerCount: response.peerCount ?? 0,
         peerDelivery: response.peerDelivery ?? null,
+        originTraffic: response.originTraffic ?? null,
         thumbnailUrl: response.thumbnailUrl,
         filePresent,
         originStatus: reachable ? "reachable" : "degraded",
@@ -2347,12 +2731,34 @@ function serveVideo(req: IncomingMessage, res: ServerResponse<IncomingMessage>, 
       "Accept-Ranges": "bytes",
       ETag: etag,
       "Cache-Control": "public, max-age=60",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Expose-Headers": "Content-Range, Content-Length, Accept-Ranges",
     });
     if (req.method === "HEAD") {
+      recordOriginTraffic({
+        videoId: video.id,
+        assetKind: "raw",
+        method: req.method,
+        requestPath: req.url ?? `/media/${encodeURIComponent(video.id)}`,
+        statusCode: 200,
+        bytesServed: 0,
+        rangeRequest: false,
+      });
       res.end();
       return;
     }
     createReadStream(video.filePath).pipe(res);
+    res.once("finish", () => {
+      recordOriginTraffic({
+        videoId: video.id,
+        assetKind: "raw",
+        method: req.method ?? "GET",
+        requestPath: req.url ?? `/media/${encodeURIComponent(video.id)}`,
+        statusCode: 200,
+        bytesServed: totalBytes,
+        rangeRequest: false,
+      });
+    });
     return;
   }
 
@@ -2361,6 +2767,7 @@ function serveVideo(req: IncomingMessage, res: ServerResponse<IncomingMessage>, 
     res.writeHead(416, {
       "Content-Range": `bytes */${totalBytes}`,
       "Accept-Ranges": "bytes",
+      "Access-Control-Allow-Origin": "*",
     });
     res.end();
     return;
@@ -2375,30 +2782,75 @@ function serveVideo(req: IncomingMessage, res: ServerResponse<IncomingMessage>, 
     "Accept-Ranges": "bytes",
     ETag: etag,
     "Cache-Control": "public, max-age=60",
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Expose-Headers": "Content-Range, Content-Length, Accept-Ranges",
   });
   if (req.method === "HEAD") {
+    recordOriginTraffic({
+      videoId: video.id,
+      assetKind: "raw",
+      method: req.method,
+      requestPath: req.url ?? `/media/${encodeURIComponent(video.id)}`,
+      statusCode: 206,
+      bytesServed: 0,
+      rangeRequest: true,
+    });
     res.end();
     return;
   }
   createReadStream(video.filePath, { start, end }).pipe(res);
+  res.once("finish", () => {
+    recordOriginTraffic({
+      videoId: video.id,
+      assetKind: "raw",
+      method: req.method ?? "GET",
+      requestPath: req.url ?? `/media/${encodeURIComponent(video.id)}`,
+      statusCode: 206,
+      bytesServed: chunkSize,
+      rangeRequest: true,
+    });
+  });
 }
 
 function serveStaticAsset(
   req: IncomingMessage,
   res: ServerResponse<IncomingMessage>,
+  videoId: string,
   asset: GeneratedAsset | GeneratedHlsFile,
+  assetKind: OriginTrafficAssetKind,
 ): void {
   const fileStat = statSync(asset.localPath);
   res.writeHead(200, {
     "Content-Type": asset.mimeType,
     "Content-Length": fileStat.size,
     "Cache-Control": asset.mimeType === "application/vnd.apple.mpegurl" ? "no-store" : "public, max-age=60",
+    "Access-Control-Allow-Origin": "*",
   });
   if (req.method === "HEAD") {
+    recordOriginTraffic({
+      videoId,
+      assetKind,
+      method: req.method,
+      requestPath: req.url ?? asset.localPath,
+      statusCode: 200,
+      bytesServed: 0,
+      rangeRequest: false,
+    });
     res.end();
     return;
   }
   createReadStream(asset.localPath).pipe(res);
+  res.once("finish", () => {
+    recordOriginTraffic({
+      videoId,
+      assetKind,
+      method: req.method ?? "GET",
+      requestPath: req.url ?? asset.localPath,
+      statusCode: 200,
+      bytesServed: fileStat.size,
+      rangeRequest: false,
+    });
+  });
 }
 
 function parseRange(header: string, totalBytes: number): { start: number; end: number } | null {

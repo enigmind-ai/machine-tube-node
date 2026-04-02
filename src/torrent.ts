@@ -9,6 +9,7 @@ export const DEFAULT_WEBTORRENT_TRACKERS = [
 type TorrentSeedOptions = {
   name?: string;
   announce?: string[];
+  urlList?: string[];
 };
 
 type TorrentClientConstructor = new (opts?: Record<string, unknown>) => TorrentClient;
@@ -21,7 +22,9 @@ type TorrentClient = {
 type TorrentHandle = {
   infoHash?: string;
   numPeers?: number;
+  torrentFile?: Uint8Array | null;
   on(event: string, listener: (...args: unknown[]) => void): void;
+  removeAllListeners?(event: string): void;
   destroy(callback?: (error?: Error | null) => void): void;
 };
 
@@ -50,6 +53,7 @@ export type TorrentRuntimeSnapshot = {
   degradedReason: string | null;
   infoHash: string | null;
   magnetUrl: string | null;
+  torrentFileUrl: string | null;
   trackerUrls: string[];
   peerCount: number;
   seededAt: string | null;
@@ -66,6 +70,9 @@ type ActiveSeedState = {
   filePath: string;
   fileSignature: string;
   displayName: string;
+  playbackUrl: string | null;
+  /** Target playbackUrl for an in-flight reseed (state.playbackUrl stays at the previous URL until success). */
+  pendingPlaybackUrl: string | null;
   trackerUrls: string[];
   seededAt: string | null;
   lastError: string | null;
@@ -74,7 +81,10 @@ type ActiveSeedState = {
   announceErrorCount: number;
   lastAnnounceError: string | null;
   torrent: TorrentHandle | null;
+  /** In-flight replacement handle during reseed; always destroyed on completion, error, or supersede. */
+  reseedHandle: TorrentHandle | null;
   pending: Promise<PersistedTorrentOutput | null> | null;
+  resolvePending: ((value: PersistedTorrentOutput | null) => void) | null;
 };
 
 async function loadTorrentClient(): Promise<LoadedTorrentClient> {
@@ -129,6 +139,23 @@ export function parseTrackerList(value: string | undefined): string[] {
 
 function isBrowserCompatibleTracker(tracker: string): boolean {
   return tracker.trim().toLowerCase().startsWith("wss://");
+}
+
+/** Tracker-only .torrent download URL is safe to advertise only for loopback HTTP (local dev), not arbitrary http origins. */
+function isLoopbackHttpPlaybackUrl(playbackUrl: string | null): boolean {
+  if (playbackUrl === null) {
+    return true;
+  }
+  try {
+    const parsed = new URL(playbackUrl);
+    if (parsed.protocol !== "http:") {
+      return false;
+    }
+    const host = parsed.hostname.toLowerCase();
+    return host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "[::1]";
+  } catch {
+    return false;
+  }
 }
 
 export class TorrentManager {
@@ -192,36 +219,28 @@ export class TorrentManager {
     filePath: string;
     fileSignature: string;
     displayName: string;
+    playbackUrl?: string | null;
   }): Promise<PersistedTorrentOutput | null> {
     if (!this.enabled) {
       return null;
     }
 
-    const existing = this.seeds.get(input.videoId);
-    if (
-      existing &&
-      existing.filePath === input.filePath &&
-      existing.fileSignature === input.fileSignature &&
-      existing.displayName === input.displayName &&
-      existing.trackerUrls.join("\n") === this.trackers.join("\n")
-    ) {
-      if (existing.pending) {
-        return existing.pending;
-      }
-
-      const persistedExisting = this.toPersistedOutput(existing);
-      if (persistedExisting) {
-        existing.lastError = null;
-        return persistedExisting;
-      }
+    const playbackUrl = input.playbackUrl ?? null;
+    const coalescedImmediate = this.tryCoalesceSeed(this.seeds.get(input.videoId), input, playbackUrl);
+    if (coalescedImmediate !== undefined) {
+      return coalescedImmediate;
     }
 
-    if (!existing && this.maxActiveTorrents !== null && this.getActiveSeedCount() >= this.maxActiveTorrents) {
+    let existing = this.seeds.get(input.videoId);
+
+    if (!existing && this.maxActiveTorrents !== null && this.getActiveTorrentHandleCount() >= this.maxActiveTorrents) {
       const state: ActiveSeedState = {
         videoId: input.videoId,
         filePath: input.filePath,
         fileSignature: input.fileSignature,
         displayName: input.displayName,
+        playbackUrl,
+        pendingPlaybackUrl: null,
         trackerUrls: [...this.trackers],
         seededAt: null,
         lastError: `Peer delivery skipped because max active torrents (${this.maxActiveTorrents}) has been reached.`,
@@ -230,14 +249,64 @@ export class TorrentManager {
         announceErrorCount: 1,
         lastAnnounceError: `Peer delivery skipped because max active torrents (${this.maxActiveTorrents}) has been reached.`,
         torrent: null,
+        reseedHandle: null,
         pending: null,
+        resolvePending: null,
       };
       this.seeds.set(input.videoId, state);
       return null;
     }
 
-    if (existing?.torrent) {
-      existing.torrent.destroy();
+    const coalescedAfterRace = this.tryCoalesceSeed(this.seeds.get(input.videoId), input, playbackUrl);
+    if (coalescedAfterRace !== undefined) {
+      return coalescedAfterRace;
+    }
+
+    existing = this.seeds.get(input.videoId);
+
+    const entryOccupiesActiveSlot = Boolean(existing?.torrent || existing?.reseedHandle || existing?.pending);
+    if (
+      !entryOccupiesActiveSlot &&
+      this.maxActiveTorrents !== null &&
+      this.getActiveTorrentHandleCount() >= this.maxActiveTorrents
+    ) {
+      if (existing) {
+        const message = `Peer delivery skipped because max active torrents (${this.maxActiveTorrents}) has been reached.`;
+        existing.lastError = message;
+        existing.lastAnnounceError = message;
+        existing.lastSeedAttemptAt = new Date().toISOString();
+        existing.announceErrorCount += 1;
+      }
+      return null;
+    }
+
+    // Capture old state but don't destroy yet — keep seeding until the
+    // replacement is confirmed healthy so a transient reseed failure doesn't
+    // cause an availability gap.
+    const previousTorrent = existing?.torrent ?? null;
+    const previousPlaybackUrl = existing?.playbackUrl ?? null;
+
+    if (existing) {
+      const handlesNow = this.getActiveTorrentHandleCount();
+      const loseFromDestroy = existing.reseedHandle ? 1 : 0;
+      const projectedAfterReseedStart = handlesNow - loseFromDestroy + 1;
+      if (this.maxActiveTorrents !== null && projectedAfterReseedStart > this.maxActiveTorrents) {
+        // Still seeding the previous torrent — do not set lastError or peers will
+        // see status:"error" and persist degraded metadata while the seed is healthy.
+        return existing.pending ?? Promise.resolve(this.toPersistedOutput(existing) ?? null);
+      }
+    }
+
+    if (existing?.resolvePending) {
+      const supersededResult = this.toPersistedOutput(existing) ?? null;
+      existing.resolvePending(supersededResult);
+      existing.resolvePending = null;
+    }
+
+    if (existing?.reseedHandle) {
+      this.clearTorrentDiagnosticsListeners(existing.reseedHandle);
+      existing.reseedHandle.destroy();
+      existing.reseedHandle = null;
     }
 
     const state: ActiveSeedState = {
@@ -245,6 +314,11 @@ export class TorrentManager {
       filePath: input.filePath,
       fileSignature: input.fileSignature,
       displayName: input.displayName,
+      // Snapshot/torrent-file URL gating only — must stay on the URL embedded
+      // in the current torrent bytes until reseed succeeds. createSeed() gets
+      // the requested URL separately so urlList matches this request.
+      playbackUrl: previousPlaybackUrl,
+      pendingPlaybackUrl: null,
       trackerUrls: [...this.trackers],
       seededAt: existing?.seededAt ?? null,
       lastError: null,
@@ -252,12 +326,60 @@ export class TorrentManager {
       lastSeedSuccessAt: existing?.lastSeedSuccessAt ?? null,
       announceErrorCount: existing?.announceErrorCount ?? 0,
       lastAnnounceError: existing?.lastAnnounceError ?? null,
-      torrent: null,
+      // Pre-populate with the previous torrent so getTorrentFile() keeps serving
+      // those bytes until createSeed's callback assigns the replacement. The new
+      // handle is tracked separately in reseedHandle so it is never orphaned.
+      torrent: previousTorrent,
+      reseedHandle: null,
       pending: null,
+      resolvePending: null,
     };
     this.seeds.set(input.videoId, state);
 
-    state.pending = this.createSeed(state);
+    if (previousTorrent) {
+      this.clearTorrentDiagnosticsListeners(previousTorrent);
+      this.attachTorrentDiagnosticsListeners(previousTorrent, input.videoId);
+    }
+
+    state.pendingPlaybackUrl = playbackUrl;
+    state.pending = new Promise<PersistedTorrentOutput | null>((resolve) => {
+      state.resolvePending = resolve;
+    });
+
+    const settlePending = (result: PersistedTorrentOutput | null): void => {
+      state.resolvePending?.(result);
+      state.resolvePending = null;
+    };
+
+    void this.createSeed(state, playbackUrl)
+      .then((result) => {
+        if (this.seeds.get(state.videoId) !== state) {
+          return result;
+        }
+        state.pendingPlaybackUrl = null;
+        if (result !== null) {
+          // New bytes are ready — advance the URL so getSnapshot() treats them
+          // as current and clients can download the updated torrent file.
+          state.playbackUrl = playbackUrl;
+          if (previousTorrent) {
+            this.clearTorrentDiagnosticsListeners(previousTorrent);
+            previousTorrent.destroy();
+          }
+        } else if (previousTorrent) {
+          // Reseed failed — restore the old torrent and the URL it was built
+          // with so getSnapshot() doesn't advertise a stale torrentFileUrl.
+          // Also clear the replacement error so the snapshot doesn't report
+          // status:"error" while the old torrent is still serving.
+          state.torrent = previousTorrent;
+          state.playbackUrl = previousPlaybackUrl;
+          state.lastError = null;
+          state.lastAnnounceError = null;
+        }
+        return result;
+      })
+      .then((result) => settlePending(result ?? null))
+      .catch(() => settlePending(null));
+
     return state.pending;
   }
 
@@ -265,7 +387,13 @@ export class TorrentManager {
     videoId: string;
     displayName: string;
     playbackUrl: string | null;
+    torrentFileUrl: string | null;
     persisted: PersistedTorrentOutput | null;
+    /**
+     * When false, tracker-only `.torrent` files are never advertised via `torrentFileUrl`,
+     * even if `playbackUrl` looks like loopback HTTP (untrusted `Host` from remote clients).
+     */
+    trustPlaybackUrlForTrackerOnlyTorrentFile?: boolean;
   }): TorrentRuntimeSnapshot {
     if (!this.enabled) {
       return {
@@ -275,6 +403,7 @@ export class TorrentManager {
         degradedReason: null,
         infoHash: null,
         magnetUrl: null,
+        torrentFileUrl: null,
         trackerUrls: [],
         peerCount: 0,
         seededAt: null,
@@ -313,6 +442,24 @@ export class TorrentManager {
             trackers: trackerUrls,
           })
         : null,
+      torrentFileUrl: (() => {
+        if (!state || !(state.torrent?.torrentFile instanceof Uint8Array) || input.torrentFileUrl == null) {
+          return null;
+        }
+        const webSeedMatchesAdvertised = state.playbackUrl === input.playbackUrl;
+        const stableTrackerOnlyIdle =
+          state.playbackUrl === null &&
+          state.pendingPlaybackUrl === null &&
+          state.pending === null;
+        // Tracker-only .torrent bytes: expose a download URL only for loopback HTTP or
+        // null playback (internal snapshot). Non-loopback http/https would disagree with
+        // bytes that embed no matching web seed.
+        const trackerOnlyTorrentFileOk =
+          (input.trustPlaybackUrlForTrackerOnlyTorrentFile !== false &&
+            isLoopbackHttpPlaybackUrl(input.playbackUrl)) &&
+          stableTrackerOnlyIdle;
+        return webSeedMatchesAdvertised || trackerOnlyTorrentFileOk ? input.torrentFileUrl : null;
+      })(),
       trackerUrls: [...trackerUrls],
       peerCount,
       seededAt,
@@ -347,15 +494,23 @@ export class TorrentManager {
       hasBrowserCompatibleTrackers: this.hasBrowserCompatibleTrackers,
       trackerUrls: [...this.trackers],
       degradedReason: this.buildDegradedReason(),
-      activeSeedCount: this.getActiveSeedCount(),
+      activeSeedCount: this.getActiveTorrentHandleCount(),
       maxActiveTorrents: this.maxActiveTorrents,
       maxConnections: this.maxConnections,
     };
   }
 
+  getTorrentFile(videoId: string): Uint8Array | null {
+    const torrentFile = this.seeds.get(videoId)?.torrent?.torrentFile;
+    return torrentFile instanceof Uint8Array ? torrentFile : null;
+  }
+
   async destroy(): Promise<void> {
     for (const state of this.seeds.values()) {
       state.torrent?.destroy();
+      state.reseedHandle?.destroy();
+      state.resolvePending?.(null);
+      state.resolvePending = null;
     }
     this.seeds.clear();
 
@@ -365,6 +520,44 @@ export class TorrentManager {
       });
       this.client = null;
     }
+  }
+
+  private tryCoalesceSeed(
+    existing: ActiveSeedState | undefined,
+    input: {
+      videoId: string;
+      filePath: string;
+      fileSignature: string;
+      displayName: string;
+    },
+    playbackUrl: string | null,
+  ): Promise<PersistedTorrentOutput | null> | PersistedTorrentOutput | undefined {
+    if (!existing) {
+      return undefined;
+    }
+    if (
+      existing.filePath !== input.filePath ||
+      existing.fileSignature !== input.fileSignature ||
+      existing.displayName !== input.displayName
+    ) {
+      return undefined;
+    }
+    const playbackMatches =
+      existing.pending != null
+        ? existing.pendingPlaybackUrl === playbackUrl
+        : existing.playbackUrl === playbackUrl;
+    if (!playbackMatches || existing.trackerUrls.join("\n") !== this.trackers.join("\n")) {
+      return undefined;
+    }
+    if (existing.pending) {
+      return existing.pending;
+    }
+    const persistedExisting = this.toPersistedOutput(existing);
+    if (persistedExisting) {
+      existing.lastError = null;
+      return persistedExisting;
+    }
+    return undefined;
   }
 
   private async getClient(): Promise<TorrentClient> {
@@ -393,18 +586,34 @@ export class TorrentManager {
     return this.clientPromise;
   }
 
-  private async createSeed(state: ActiveSeedState): Promise<PersistedTorrentOutput | null> {
+  private async createSeed(
+    state: ActiveSeedState,
+    webSeedUrlForTorrent: string | null,
+  ): Promise<PersistedTorrentOutput | null> {
     try {
       state.lastSeedAttemptAt = new Date().toISOString();
       const client = await this.getClient();
+      if (this.seeds.get(state.videoId) !== state) {
+        return null;
+      }
       const persisted = await new Promise<PersistedTorrentOutput>((resolve, reject) => {
         const torrent = client.seed(
           state.filePath,
           {
             name: state.displayName,
             announce: state.trackerUrls,
+            ...(webSeedUrlForTorrent ? { urlList: [webSeedUrlForTorrent] } : {}),
           },
           (seededTorrent) => {
+            if (this.seeds.get(state.videoId) !== state) {
+              this.clearTorrentDiagnosticsListeners(seededTorrent);
+              seededTorrent.destroy();
+              state.reseedHandle = null;
+              reject(new Error("Seeding superseded by a newer ensureSeed for this video."));
+              return;
+            }
+
+            state.reseedHandle = null;
             state.torrent = seededTorrent;
 
             if (!seededTorrent.infoHash) {
@@ -428,31 +637,49 @@ export class TorrentManager {
           }
         );
 
-        state.torrent = torrent;
-        torrent.on("warning", (error) => {
-          const message = error instanceof Error ? error.message : String(error);
-          state.lastAnnounceError = message;
-          state.lastError = message;
-          state.announceErrorCount += 1;
-        });
-        torrent.on("error", (error) => {
-          const message = error instanceof Error ? error.message : String(error);
-          state.lastAnnounceError = message;
-          state.lastError = message;
-          state.announceErrorCount += 1;
-        });
+        state.reseedHandle = torrent;
+        this.attachTorrentDiagnosticsListeners(torrent, state.videoId);
       });
 
       state.pending = null;
       return persisted;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      if (state.reseedHandle) {
+        this.clearTorrentDiagnosticsListeners(state.reseedHandle);
+        state.reseedHandle.destroy();
+      }
+      state.reseedHandle = null;
       state.lastError = message;
       state.lastAnnounceError = message;
       state.announceErrorCount += 1;
       state.pending = null;
       return null;
     }
+  }
+
+  private clearTorrentDiagnosticsListeners(torrent: TorrentHandle): void {
+    torrent.removeAllListeners?.("warning");
+    torrent.removeAllListeners?.("error");
+  }
+
+  /**
+   * Attach announce/seed diagnostics to a handle using the live map entry for `videoId`
+   * so in-place reseeds keep reporting on the current {@link ActiveSeedState}.
+   */
+  private attachTorrentDiagnosticsListeners(torrent: TorrentHandle, videoId: string): void {
+    const onIssue = (error: unknown): void => {
+      const live = this.seeds.get(videoId);
+      if (!live || (live.torrent !== torrent && live.reseedHandle !== torrent)) {
+        return;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      live.lastAnnounceError = message;
+      live.lastError = message;
+      live.announceErrorCount += 1;
+    };
+    torrent.on("warning", onIssue);
+    torrent.on("error", onIssue);
   }
 
   private refreshCompatibilityState(): void {
@@ -475,10 +702,20 @@ export class TorrentManager {
     return null;
   }
 
-  private getActiveSeedCount(): number {
+  /**
+   * Open WebTorrent torrent handles plus an in-flight reservation while a seed is starting
+   * (after `resolvePending` is set, possibly before `reseedHandle` exists — e.g. slow `getClient()`).
+   * Reseed briefly holds two handles per video: previous torrent + replacement.
+   */
+  private getActiveTorrentHandleCount(): number {
     let count = 0;
     for (const state of this.seeds.values()) {
-      if (state.torrent || state.pending) {
+      if (state.torrent) {
+        count += 1;
+      }
+      if (state.reseedHandle) {
+        count += 1;
+      } else if (state.resolvePending !== null) {
         count += 1;
       }
     }

@@ -25,7 +25,9 @@ function runOrThrow(command: string, args: string[], options: Parameters<typeof 
   }
 
   if (result.status !== 0) {
-    const stderr = result.stderr?.trim() || "";
+    const s = result.stderr;
+    const stderr =
+      s == null ? "" : typeof s === "string" ? s.trim() : Buffer.from(s).toString("utf8").trim();
     throw new Error(`${command} ${args.join(" ")} failed${stderr ? `: ${stderr}` : "."}`);
   }
 }
@@ -175,7 +177,7 @@ test("tracks publish history when the same file is published to MachineTube mult
     });
 
     let stderr = "";
-    mtNode.stderr.on("data", (chunk) => {
+    mtNode.stderr?.on("data", (chunk) => {
       stderr += chunk.toString("utf8");
     });
 

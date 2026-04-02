@@ -25,7 +25,9 @@ function runOrThrow(command: string, args: string[], options: Parameters<typeof 
   }
 
   if (result.status !== 0) {
-    const stderr = result.stderr?.trim() || "";
+    const s = result.stderr;
+    const stderr =
+      s == null ? "" : typeof s === "string" ? s.trim() : Buffer.from(s).toString("utf8").trim();
     throw new Error(`${command} ${args.join(" ")} failed${stderr ? `: ${stderr}` : "."}`);
   }
 }
@@ -197,7 +199,7 @@ test("mt-node publish exposes peer-assisted delivery metadata to MachineTube and
     });
 
     let stderr = "";
-    mtNode.stderr.on("data", (chunk) => {
+    mtNode.stderr?.on("data", (chunk) => {
       stderr += chunk.toString("utf8");
     });
 
@@ -231,7 +233,7 @@ test("mt-node publish exposes peer-assisted delivery metadata to MachineTube and
     assert.equal(videosPayload.videos[0].outputs.torrent.status, "seeding");
     assert.match(String(videosPayload.videos[0].outputs.torrent.infoHash ?? ""), /^[a-f0-9]{40}$/);
     assert.equal(videosPayload.videos[0].outputs.torrent.browserPeerCompatible, true);
-    assert.equal(videosPayload.videos[0].peerDelivery.status, "available");
+    assert.equal(videosPayload.videos[0].peerDelivery.available, true);
     assert.equal(
       videosPayload.videos[0].torrentMagnetUrl,
       publishRequests[0].externalPlaybackMagnetUrl
@@ -246,7 +248,7 @@ test("mt-node publish exposes peer-assisted delivery metadata to MachineTube and
       statusPayload.heartbeat.publishedVideos[0].torrentMagnetUrl,
       publishRequests[0].externalPlaybackMagnetUrl
     );
-    assert.equal(statusPayload.heartbeat.publishedVideos[0].peerDelivery.status, "available");
+    assert.equal(statusPayload.heartbeat.publishedVideos[0].peerDelivery.available, true);
     assert.equal(stderr.trim(), "");
   } finally {
     mtNode?.kill("SIGTERM");
@@ -376,7 +378,7 @@ test("permanent peer delivery restores published torrent seeds after mt-node res
 
     assert.equal(publishCount, 1);
     assert.equal(restoredVideos.videos[0].machineTube.videoId, "vid_restore_test");
-    assert.equal(restoredVideos.videos[0].peerDelivery.status, "available");
+    assert.equal(restoredVideos.videos[0].peerDelivery.available, true);
     assert.equal(restoredVideos.videos[0].outputs.torrent.lastSeedSuccessAt !== null, true);
     assert.equal(restoredStatus.peerDelivery.mode, "permanent");
     assert.equal(restoredStatus.peerDelivery.activeSeedCount, 1);
@@ -388,6 +390,233 @@ test("permanent peer delivery restores published torrent seeds after mt-node res
       new Promise((resolve) => setTimeout(resolve, 3000)),
     ]);
     await new Promise((resolve) => machineTubeServer.close(resolve));
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("assist peer delivery: MachineTube origin sync does not start extra torrent seeds beyond the active cap", async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), "mt-node-assist-sync-cap-"));
+  const dataDir = path.join(tempRoot, "data");
+  const samplePathA = path.join(tempRoot, "sample-a.mp4");
+  const samplePathB = path.join(tempRoot, "sample-b.mp4");
+  const ffmpegPath = path.join(dataDir, "bin", process.platform === "win32" ? "ffmpeg.exe" : "ffmpeg");
+
+  let publishCount = 0;
+  const machineTubeServer = http.createServer(async (req, res) => {
+    const url = new URL(req.url ?? "/", "http://127.0.0.1");
+
+    if (req.method === "POST" && url.pathname === "/api/videos") {
+      publishCount += 1;
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          videoId: `vid_assist_cap_${publishCount}`,
+          status: "published",
+          watchUrl: `http://127.0.0.1/watch/vid_assist_cap_${publishCount}`,
+        }),
+      );
+      return;
+    }
+
+    if (req.method === "PATCH" && url.pathname.startsWith("/api/videos/")) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+
+    res.writeHead(404, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Not found." }));
+  });
+
+  let mtNode: ReturnType<typeof spawn> | null = null;
+
+  try {
+    const machineTubePort = await listen(machineTubeServer);
+    const mtNodePort = await reservePort();
+    const baseUrl = `http://127.0.0.1:${mtNodePort}`;
+
+    runOrThrow("node", [bootstrapEntry], {
+      cwd: repoRoot,
+      env: {
+        ...process.env,
+        MT_NODE_DATA_DIR: dataDir,
+      },
+    });
+
+    const makeSample = (target: string) =>
+      runOrThrow(ffmpegPath, [
+        "-hide_banner",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=size=320x180:rate=24",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=440",
+        "-t",
+        "1",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        target,
+      ]);
+
+    makeSample(samplePathA);
+    makeSample(samplePathB);
+
+    mtNode = spawn("node", ["--import", "tsx", mtNodeEntry], {
+      cwd: repoRoot,
+      env: {
+        ...process.env,
+        MT_NODE_HOST: "127.0.0.1",
+        MT_NODE_PORT: String(mtNodePort),
+        MT_NODE_DATA_DIR: dataDir,
+        MT_NODE_PUBLIC_BASE_URL: "https://origin.example.test",
+        MT_NODE_PEER_DELIVERY_MODE: "assist",
+        MT_NODE_PEER_DELIVERY_MAX_ACTIVE_TORRENTS: "1",
+        MT_NODE_SYNC_INTERVAL_MS: "400",
+        MT_MACHINETUBE_BASE_URL: `http://127.0.0.1:${machineTubePort}`,
+        MT_MACHINETUBE_AGENT_ID: "agt_assist_sync_cap",
+        MT_MACHINETUBE_API_KEY: "mt_test_key",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let stderr = "";
+    mtNode.stderr?.on("data", (chunk) => {
+      stderr += chunk.toString("utf8");
+    });
+
+    await waitFor(`${baseUrl}/healthz`, 15000);
+
+    await fetchJson(`${baseUrl}/publish`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        filePath: samplePathA,
+        title: "Assist cap sample A",
+      }),
+    });
+    await fetchJson(`${baseUrl}/publish`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        filePath: samplePathB,
+        title: "Assist cap sample B",
+      }),
+    });
+
+    await new Promise((r) => setTimeout(r, 2500));
+
+    const statusPayload = await fetchJson(`${baseUrl}/status`);
+    assert.equal(statusPayload.peerDelivery.mode, "assist");
+    assert.equal(
+      statusPayload.peerDelivery.maxActiveTorrents,
+      1,
+      "expected max active torrents cap from env",
+    );
+    assert.ok(
+      statusPayload.peerDelivery.activeSeedCount <= 1,
+      `sync loop must not raise activeSeedCount above cap (got ${statusPayload.peerDelivery.activeSeedCount})`,
+    );
+    assert.equal(stderr.trim(), "");
+  } finally {
+    mtNode?.kill("SIGTERM");
+    await Promise.race([
+      new Promise((resolve) => mtNode?.once("exit", resolve)),
+      new Promise((resolve) => setTimeout(resolve, 3000)),
+    ]);
+    await new Promise((resolve) => machineTubeServer.close(resolve));
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("/videos/register keeps new video eligible for tunnel reseed (schedules reseed after registration)", async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), "mt-node-register-reseed-"));
+  const dataDir = path.join(tempRoot, "data");
+  const samplePath = path.join(tempRoot, "register-sample.mp4");
+  const ffmpegPath = path.join(dataDir, "bin", process.platform === "win32" ? "ffmpeg.exe" : "ffmpeg");
+  const publicOrigin = "https://register-reseed-origin.test";
+  let mtNode: ReturnType<typeof spawn> | null = null;
+
+  try {
+    runOrThrow("node", [bootstrapEntry], {
+      cwd: repoRoot,
+      env: { ...process.env, MT_NODE_DATA_DIR: dataDir },
+    });
+
+    runOrThrow(ffmpegPath, [
+      "-hide_banner",
+      "-y",
+      "-f",
+      "lavfi",
+      "-i",
+      "testsrc=size=320x180:rate=24",
+      "-f",
+      "lavfi",
+      "-i",
+      "sine=frequency=440",
+      "-t",
+      "1",
+      "-c:v",
+      "libx264",
+      "-pix_fmt",
+      "yuv420p",
+      "-c:a",
+      "aac",
+      samplePath,
+    ]);
+
+    const mtNodePort = await reservePort();
+    const baseUrl = `http://127.0.0.1:${mtNodePort}`;
+
+    mtNode = spawn("node", ["--import", "tsx", mtNodeEntry], {
+      cwd: repoRoot,
+      env: {
+        ...process.env,
+        MT_NODE_HOST: "127.0.0.1",
+        MT_NODE_PORT: String(mtNodePort),
+        MT_NODE_DATA_DIR: dataDir,
+        MT_NODE_PUBLIC_BASE_URL: publicOrigin,
+        MT_NODE_PEER_DELIVERY_MODE: "assist",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    await waitFor(`${baseUrl}/healthz`, 15000);
+
+    await fetchJson(`${baseUrl}/videos/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ filePath: samplePath }),
+    });
+
+    const list = await waitForJsonCondition(
+      `${baseUrl}/videos`,
+      (body: { videos: Array<{ torrentMagnetUrl?: string }> }) =>
+        Array.isArray(body.videos) &&
+        body.videos.length > 0 &&
+        typeof body.videos[0].torrentMagnetUrl === "string" &&
+        body.videos[0].torrentMagnetUrl!.includes(new URL(publicOrigin).host),
+      15000,
+    );
+
+    const magnet = list.videos[0].torrentMagnetUrl as string;
+    assert.ok(
+      magnet.includes("register-reseed-origin.test"),
+      "magnet should reference the configured public origin after register + reseed",
+    );
+  } finally {
+    mtNode?.kill("SIGTERM");
+    await Promise.race([
+      new Promise((resolve) => mtNode?.once("exit", resolve)),
+      new Promise((resolve) => setTimeout(resolve, 3000)),
+    ]);
     await rm(tempRoot, { recursive: true, force: true });
   }
 });
